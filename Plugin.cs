@@ -9,6 +9,7 @@ using Dalamud.Game.Command;
 using Dalamud.Interface.GameFonts;
 using Dalamud.Interface.ManagedFontAtlas;
 using Dalamud.Interface.Utility;
+using Dalamud.Interface.Utility.Raii;
 using Dalamud.IoC;
 using Dalamud.Plugin;
 using Dalamud.Plugin.Services;
@@ -389,60 +390,76 @@ public sealed unsafe class Plugin : IDalamudPlugin
                     | ImGuiWindowFlags.NoFocusOnAppearing
                     | ImGuiWindowFlags.NoNav;
 
-        ImGui.PushStyleVar(ImGuiStyleVar.WindowPadding, Vector2.Zero);
-        ImGui.PushStyleVar(ImGuiStyleVar.WindowBorderSize, 0f);
-        ImGui.PushStyleVar(ImGuiStyleVar.WindowRounding, 0f);
-        ImGui.PushStyleColor(ImGuiCol.WindowBg, Vector4.Zero);
-
         var clicked = false;
         active = false;
+        var beginCalled = false;
 
-        if (ImGui.Begin(windowId, flags))
+        using var windowPadding = ImRaii.PushStyle(ImGuiStyleVar.WindowPadding, Vector2.Zero);
+        using var windowBorder = ImRaii.PushStyle(ImGuiStyleVar.WindowBorderSize, 0f);
+        using var windowRounding = ImRaii.PushStyle(ImGuiStyleVar.WindowRounding, 0f);
+        using var windowBackground = ImRaii.PushColor(ImGuiCol.WindowBg, Vector4.Zero);
+
+        try
         {
-            var drawList = ImGui.GetWindowDrawList();
-            var min = ImGui.GetWindowPos();
-            var max = min + size;
-
-            ImGui.SetCursorScreenPos(min);
-            clicked = ImGui.InvisibleButton(buttonId, size);
-            var hovered = ImGui.IsItemHovered();
-            active = ImGui.IsItemActive();
-
-            if (hovered)
+            var windowVisible = ImGui.Begin(windowId, flags);
+            beginCalled = true;
+            if (windowVisible)
             {
-                ImGui.SetMouseCursor(ImGuiMouseCursor.Hand);
+                var drawList = ImGui.GetWindowDrawList();
+                var min = ImGui.GetWindowPos();
+                var max = min + size;
+
+                ImGui.SetCursorScreenPos(min);
+                clicked = ImGui.InvisibleButton(buttonId, size);
+                var hovered = ImGui.IsItemHovered();
+                active = ImGui.IsItemActive();
+
+                if (hovered)
+                {
+                    ImGui.SetMouseCursor(ImGuiMouseCursor.Hand);
+                }
+
+                var background = editing
+                    ? colors.EditButton
+                    : active
+                        ? colors.ButtonActive
+                        : colors.Button;
+
+                var rounding = Math.Max(2f, size.Y * 0.14f);
+                drawList.AddRectFilled(min, max, Color(background), rounding);
+                drawList.AddRect(min, max, Color(colors.Border), rounding, ImDrawFlags.None, Math.Max(1f, size.Y * 0.045f));
+
+                IDisposable? pushedFont = null;
+                try
+                {
+                    if (this.symbolFont.Available)
+                    {
+                        pushedFont = this.symbolFont.Push();
+                    }
+
+                    var text = "♥";
+                    var textSize = ImGui.CalcTextSize(text);
+                    var textPos = min + (size - textSize) * 0.5f;
+                    var textColor = hovered && !editing
+                        ? new Vector4(1f, 0.08f, 0.08f, 1f)
+                        : colors.Text;
+
+                    drawList.AddText(textPos, Color(textColor), text);
+                }
+                finally
+                {
+                    pushedFont?.Dispose();
+                }
             }
-
-            var background = editing
-                ? colors.EditButton
-                : active
-                    ? colors.ButtonActive
-                    : colors.Button;
-
-            var rounding = Math.Max(2f, size.Y * 0.14f);
-            drawList.AddRectFilled(min, max, Color(background), rounding);
-            drawList.AddRect(min, max, Color(colors.Border), rounding, ImDrawFlags.None, Math.Max(1f, size.Y * 0.045f));
-
-            IDisposable? pushedFont = null;
-            if (this.symbolFont.Available)
+        }
+        finally
+        {
+            if (beginCalled)
             {
-                pushedFont = this.symbolFont.Push();
+                ImGui.End();
             }
-
-            var text = "♥";
-            var textSize = ImGui.CalcTextSize(text);
-            var textPos = min + (size - textSize) * 0.5f;
-            var textColor = hovered && !editing
-                ? new Vector4(1f, 0.08f, 0.08f, 1f)
-                : colors.Text;
-
-            drawList.AddText(textPos, Color(textColor), text);
-            pushedFont?.Dispose();
         }
 
-        ImGui.End();
-        ImGui.PopStyleColor();
-        ImGui.PopStyleVar(3);
         return clicked;
     }
 
@@ -523,76 +540,86 @@ public sealed unsafe class Plugin : IDalamudPlugin
                     | ImGuiWindowFlags.NoFocusOnAppearing
                     | ImGuiWindowFlags.NoNav;
 
-        ImGui.PushStyleVar(ImGuiStyleVar.WindowPadding, new Vector2(padding, padding));
-        ImGui.PushStyleVar(ImGuiStyleVar.WindowBorderSize, 1f * scale);
-        ImGui.PushStyleVar(ImGuiStyleVar.WindowRounding, 8f * scale);
-        ImGui.PushStyleColor(ImGuiCol.WindowBg, colors.PopupBackground);
-        ImGui.PushStyleColor(ImGuiCol.Border, colors.Border);
+        var beginCalled = false;
 
-        if (ImGui.Begin($"##QuickSymbolsPopup{idSuffix}", flags))
+        using var popupPadding = ImRaii.PushStyle(ImGuiStyleVar.WindowPadding, new Vector2(padding, padding));
+        using var popupBorderSize = ImRaii.PushStyle(ImGuiStyleVar.WindowBorderSize, 1f * scale);
+        using var popupRounding = ImRaii.PushStyle(ImGuiStyleVar.WindowRounding, 8f * scale);
+        using var popupBackground = ImRaii.PushColor(ImGuiCol.WindowBg, colors.PopupBackground);
+        using var popupBorder = ImRaii.PushColor(ImGuiCol.Border, colors.Border);
+
+        try
         {
-            var windowPos = ImGui.GetWindowPos();
-            var drawList = ImGui.GetWindowDrawList();
-            var title = "Bryer - Quick Symbols";
-            ImGui.TextColored(colors.MutedText, title);
-
-            var closeSize = new Vector2(22f * scale, 22f * scale);
-            var closePos = new Vector2(windowPos.X + popupWidth - padding - closeSize.X, windowPos.Y + padding - 1f * scale);
-
-            if (includePositionEditor)
+            var windowVisible = ImGui.Begin($"##QuickSymbolsPopup{idSuffix}", flags);
+            beginCalled = true;
+            if (windowVisible)
             {
-                var editLabel = this.editButtonPosition ? "Editing button position" : "Change button position";
-                var editButtonSize = new Vector2(
-                    Math.Min(
-                        Math.Max(126f * scale, ImGui.CalcTextSize(editLabel).X + 16f * scale),
-                        Math.Max(80f * scale, closePos.X - (windowPos.X + padding + ImGui.CalcTextSize(title).X + 12f * scale) - 6f * scale)),
-                    22f * scale);
-                var editButtonPos = new Vector2(windowPos.X + padding + ImGui.CalcTextSize(title).X + 12f * scale, windowPos.Y + padding - 1f * scale);
+                var windowPos = ImGui.GetWindowPos();
+                var drawList = ImGui.GetWindowDrawList();
+                var title = "Bryer - Quick Symbols";
+                ImGui.TextColored(colors.MutedText, title);
 
-                ImGui.SetCursorScreenPos(editButtonPos);
-                ImGui.PushStyleColor(ImGuiCol.Button, this.editButtonPosition ? colors.EditButton : colors.Button);
-                ImGui.PushStyleColor(ImGuiCol.ButtonHovered, this.editButtonPosition ? colors.EditButtonHovered : colors.ButtonHovered);
-                ImGui.PushStyleColor(ImGuiCol.ButtonActive, colors.ButtonActive);
-                ImGui.PushStyleColor(ImGuiCol.Text, colors.Text);
-                if (ImGui.Button(editLabel, editButtonSize))
+                var closeSize = new Vector2(22f * scale, 22f * scale);
+                var closePos = new Vector2(windowPos.X + popupWidth - padding - closeSize.X, windowPos.Y + padding - 1f * scale);
+
+                if (includePositionEditor)
                 {
-                    this.editButtonPosition = !this.editButtonPosition;
-                    this.draggingButton = false;
-                    this.SaveConfigurationIfDirty();
+                    var editLabel = this.editButtonPosition ? "Editing button position" : "Change button position";
+                    var editButtonSize = new Vector2(
+                        Math.Min(
+                            Math.Max(126f * scale, ImGui.CalcTextSize(editLabel).X + 16f * scale),
+                            Math.Max(80f * scale, closePos.X - (windowPos.X + padding + ImGui.CalcTextSize(title).X + 12f * scale) - 6f * scale)),
+                        22f * scale);
+                    var editButtonPos = new Vector2(windowPos.X + padding + ImGui.CalcTextSize(title).X + 12f * scale, windowPos.Y + padding - 1f * scale);
+
+                    ImGui.SetCursorScreenPos(editButtonPos);
+                    using (ImRaii.PushColor(ImGuiCol.Button, this.editButtonPosition ? colors.EditButton : colors.Button))
+                    using (ImRaii.PushColor(ImGuiCol.ButtonHovered, this.editButtonPosition ? colors.EditButtonHovered : colors.ButtonHovered))
+                    using (ImRaii.PushColor(ImGuiCol.ButtonActive, colors.ButtonActive))
+                    using (ImRaii.PushColor(ImGuiCol.Text, colors.Text))
+                    {
+                        if (ImGui.Button(editLabel, editButtonSize))
+                        {
+                            this.editButtonPosition = !this.editButtonPosition;
+                            this.draggingButton = false;
+                            this.SaveConfigurationIfDirty();
+                        }
+                    }
                 }
 
-                ImGui.PopStyleColor(4);
+                ImGui.SetCursorScreenPos(closePos);
+                if (ImGui.InvisibleButton($"##QuickSymbolsCloseButton{idSuffix}", closeSize))
+                {
+                    isOpen = false;
+                }
+
+                var closeHovered = ImGui.IsItemHovered();
+                drawList.AddRectFilled(closePos, closePos + closeSize, Color(closeHovered ? colors.CellHovered : colors.CellBackground), 4f * scale);
+                var xText = "X";
+                var xSize = ImGui.CalcTextSize(xText);
+                drawList.AddText(closePos + (closeSize - xSize) * 0.5f, Color(colors.Text), xText);
+
+                var contentStartY = windowPos.Y + padding + headerHeight + 6f * scale;
+                var contentHeight = popupHeight - padding - (contentStartY - windowPos.Y);
+                ImGui.SetCursorScreenPos(new Vector2(windowPos.X + padding, contentStartY));
+
+                var favoritesHeight = this.DrawFavoritesSection(idSuffix, columns, cell, spacing, gridWidth, colors, insertTarget);
+                if (favoritesHeight > 0f)
+                {
+                    ImGui.SetCursorScreenPos(new Vector2(windowPos.X + padding, contentStartY + favoritesHeight));
+                }
+
+                var gridHeight = Math.Max(cell, contentHeight - favoritesHeight);
+                this.DrawSymbolsGrid(idSuffix, columns, totalRows, cell, spacing, gridHeight, scrollBarWidth, colors, insertTarget);
             }
-
-            ImGui.SetCursorScreenPos(closePos);
-            if (ImGui.InvisibleButton($"##QuickSymbolsCloseButton{idSuffix}", closeSize))
-            {
-                isOpen = false;
-            }
-
-            var closeHovered = ImGui.IsItemHovered();
-            drawList.AddRectFilled(closePos, closePos + closeSize, Color(closeHovered ? colors.CellHovered : colors.CellBackground), 4f * scale);
-            var xText = "X";
-            var xSize = ImGui.CalcTextSize(xText);
-            drawList.AddText(closePos + (closeSize - xSize) * 0.5f, Color(colors.Text), xText);
-
-            var contentStartY = windowPos.Y + padding + headerHeight + 6f * scale;
-            var contentHeight = popupHeight - padding - (contentStartY - windowPos.Y);
-            ImGui.SetCursorScreenPos(new Vector2(windowPos.X + padding, contentStartY));
-
-            var favoritesHeight = this.DrawFavoritesSection(idSuffix, columns, cell, spacing, gridWidth, colors, insertTarget);
-            if (favoritesHeight > 0f)
-            {
-                ImGui.SetCursorScreenPos(new Vector2(windowPos.X + padding, contentStartY + favoritesHeight));
-            }
-
-            var gridHeight = Math.Max(cell, contentHeight - favoritesHeight);
-            this.DrawSymbolsGrid(idSuffix, columns, totalRows, cell, spacing, gridHeight, scrollBarWidth, colors, insertTarget);
         }
-
-        ImGui.End();
-        ImGui.PopStyleColor(2);
-        ImGui.PopStyleVar(3);
+        finally
+        {
+            if (beginCalled)
+            {
+                ImGui.End();
+            }
+        }
     }
 
     private float DrawFavoritesSection(string idSuffix, int columns, float cell, float spacing, float gridWidth, UiColors colors, SymbolInsertTarget insertTarget)
