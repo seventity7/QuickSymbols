@@ -1,12 +1,16 @@
-`Initial Release - May 1 2026`
+`Most recent changelog - May 03 2026`
 
-## What to expect to have
+## What to expect
 
 ### Quick symbol button
 
 - Added a new `♥` button near the game's ChatLog controls.
-- Clicking the button opens a symbol picker popup.
-- Clicking the button again closes the popup.
+  - Clicking the button opens a symbol picker popup.
+  - Clicking the button again closes the popup.
+- Added `Custom` tab to the symbol popup
+  - Show custom entries created by user to use your own symbols, text or short snippets
+  - Can be configured with the command `/qsconfig`
+- Added a configurable keybind for opening the symbol popup near the current mouse position for any text input
 - The popup also has an `X` button to close it.
 
 ### Symbol picker popup
@@ -55,6 +59,6 @@ QuickSymbols can currently be used in:
 
 - It only inserts the selected symbol into the text field you are currently using.
 - The popup remains open until you close it manually.
-- Favorite symbols are saved between game sessions.
+- Favorite symbols and custom entries are saved between game sessions.
 
 `End of changelog`

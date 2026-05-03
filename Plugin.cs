@@ -1,11 +1,15 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Linq;
 using System.Numerics;
 using System.Runtime.InteropServices;
+using System.Diagnostics;
 using Dalamud.Bindings.ImGui;
 using Dalamud.Configuration;
 using Dalamud.Game.Command;
+using Dalamud.Game.ClientState.Keys;
+using Dalamud.Game.Text;
 using Dalamud.Interface.GameFonts;
 using Dalamud.Interface.ManagedFontAtlas;
 using Dalamud.Interface.Utility;
@@ -15,28 +19,11 @@ using Dalamud.Plugin;
 using Dalamud.Plugin.Services;
 using FFXIVClientStructs.FFXIV.Client.UI;
 using FFXIVClientStructs.FFXIV.Component.GUI;
-
 namespace QuickSymbols;
-
-[Serializable]
-public sealed class PluginConfiguration : IPluginConfiguration
-{
-    public int Version { get; set; } = 4;
-
-    // Kept for compatibility with older config files. New versions store the custom
-    // placement as an offset from the native chat button so it follows the ChatLog.
-    public bool HasCustomButtonPosition { get; set; }
-    public Vector2 ButtonPosition { get; set; }
-    public bool UsesRelativeButtonOffset { get; set; }
-    public Vector2 ButtonOffset { get; set; }
-
-    public List<string> FavoriteSymbols { get; set; } = new();
-}
 
 public sealed unsafe class Plugin : IDalamudPlugin
 {
     private const string ChatLogAddonName = "ChatLog";
-    private const string RecruitmentCriteriaAddonName = "LookingForGroupCondition";
     private static readonly string[] RecruitmentCriteriaAddonNames =
     [
         "LookingForGroupCondition",
@@ -52,238 +39,688 @@ public sealed unsafe class Plugin : IDalamudPlugin
         "HousingGuestBook",
         "HousingGuestBookInputMessage",
     ];
-    private const string CommandShort = "/qs";
-    private const string CommandLong = "/quicksymbols";
-    private const int MaxColumns = 10;
 
+    private const int MaxColumns = 10;
     private static readonly string[] Symbols = BuildSymbols();
 
-    [PluginService]
-    internal static IDalamudPluginInterface PluginInterface { get; private set; } = null!;
+    private const string CommandShort = "/qs";
+    private const string CommandLong = "/quicksymbols";
+    private const string CommandConfig = "/qsconfig";
 
-    [PluginService]
-    internal static IGameGui GameGui { get; private set; } = null!;
+    [PluginService] internal static IDalamudPluginInterface PluginInterface { get; private set; } = null!;
+    [PluginService] internal static IGameGui GameGui { get; private set; } = null!;
+    [PluginService] internal static IFramework Framework { get; private set; } = null!;
+    [PluginService] internal static ICommandManager CommandManager { get; private set; } = null!;
+    [PluginService] internal static IGameConfig GameConfig { get; private set; } = null!;
+    [PluginService] internal static IKeyState KeyState { get; private set; } = null!;
+    [PluginService] internal static IPluginLog Log { get; private set; } = null!;
 
-    [PluginService]
-    internal static IFramework Framework { get; private set; } = null!;
+    public sealed class PluginConfiguration : IPluginConfiguration
+    {
+        public int Version { get; set; } = 1;
+        public VirtualKey[] ToggleHotkey { get; set; } = [VirtualKey.MENU, VirtualKey.S];
+        public List<string> Custom { get; set; } = [];
 
-    [PluginService]
-    internal static ICommandManager CommandManager { get; private set; } = null!;
+        // Current plugin config keeps the original Quick Symbols field while
+        // still accepting the temporary tweak field name used by the SimpleTweaks version.
+        public List<string> FavoriteSymbols { get; set; } = [];
+        public List<string> favsymbols { get; set; } = [];
 
-    [PluginService]
-    internal static IGameConfig GameConfig { get; private set; } = null!;
+        // Keep this in sake of compatibility with older 'QuickSymbols' config files
+        public List<string> History { get; set; } = [];
+        public bool ShowHistory { get; set; } = false;
+        public bool ShowAllTab { get; set; } = false;
+        public bool ShowTitles { get; set; } = true;
+        // #
+        public int MaxHistory { get; set; } = 25;
 
-    [PluginService]
-    internal static IPluginLog Log { get; private set; } = null!;
+        // Original Quick Symbols position fields.
+        public bool HasCustomButtonPosition { get; set; }
+        public Vector2 ButtonPosition { get; set; }
 
-    private readonly IFontHandle symbolFont;
-    private readonly PluginConfiguration configuration;
+        // Compatibility with the temporary SimpleTweaks version of this code.
+        public bool HasCustombPosition { get; set; }
+        public bool UsesRelativeButtonOffset { get; set; }
+        public Vector2 bPosition { get; set; }
+        public Vector2 ButtonOffset { get; set; }
+    }
+
+    private readonly PluginConfiguration Config;
+
+    // UI and State stuff
+    private IFontHandle? symbolFont;
+    private PopupTab selectedPopupTab = PopupTab.Symbols;
+    private string newCustomEntry = string.Empty;
+    // #
+
+    // Control and Visibility stuff
     private bool popupOpen;
     private bool partyFinderPopupOpen;
     private bool messageBookPopupOpen;
-    private bool editButtonPosition;
+    private bool keybindPopupOpen;
+    // #
+
+    // Main positioning related stuff
+    private bool editbPosition;
     private bool draggingButton;
-    private bool buttonPositionDirty;
-    private Vector2 nativeButtonPos;
-    private Vector2 currentButtonPos;
-    private Vector2 currentButtonSize;
-    private Vector2 partyFinderButtonPos;
-    private Vector2 partyFinderButtonSize;
-    private Vector2 messageBookButtonPos;
-    private Vector2 messageBookButtonSize;
+    private bool bPositionDirty;
+    private Vector2 nativebPos;
+    private Vector2 currentbPos;
+    private Vector2 currentbSize;
+    // #
+
+    // Party Finder/House Message Book
+    private Vector2 partyFinderbPos;
+    private Vector2 partyFinderbSize;
+    private Vector2 messageBookbPos;
+    private Vector2 messageBookbSize;
+    // #
+
+    // New Keybind Popup | Kept 'Toggle Character Selector' option from original 'QuickSymbols'
+    private Vector2 keybindPopupAnchorPos;
+    private Vector2 keybindPopupAnchorSize;
+    private AtkComponentTextInput* keybindTextInput;
+    // #
+
+    // Scroll
     private float symbolScrollY;
+    private float customScrollY;
     private bool draggingScrollBar;
     private float scrollDragOffsetY;
+    private bool configWindowOpen;
+    private bool hotkeyRecording;
+    private bool hotkeyFocused;
+    private bool hotkeyWasDown;
+    private readonly List<VirtualKey> pendingHotkey = [];
+    private readonly Stopwatch hotkeySafety = Stopwatch.StartNew();
+    // #
 
     public Plugin()
     {
-        this.configuration = PluginInterface.GetPluginConfig() as PluginConfiguration ?? new PluginConfiguration();
+        this.Config = PluginInterface.GetPluginConfig() as PluginConfiguration ?? new PluginConfiguration();
+        this.ConfigChanged();
+
         this.symbolFont = PluginInterface.UiBuilder.FontAtlas.NewGameFontHandle(new GameFontStyle(GameFontFamily.Axis, 18f));
-
         PluginInterface.UiBuilder.Draw += this.Draw;
+        PluginInterface.UiBuilder.OpenConfigUi += this.OpenConfigWindow;
+        PluginInterface.UiBuilder.OpenMainUi += this.OpenMainWindow;
+        Framework.Update += this.FrameworkUpdate;
 
-        var commandInfo = new CommandInfo(this.OnCommand)
+        this.RegisterCommand(CommandShort, "Open Quick Symbols.");
+        this.RegisterCommand(CommandLong, "Open Quick Symbols.");
+        this.RegisterCommand(CommandConfig, "Open Quick Symbols configuration.");
+
+        Log.Information("Quick Symbols loaded.");
+    }
+
+    private void ConfigChanged()
+    {
+        this.Config.Custom ??= [];
+        this.Config.FavoriteSymbols ??= [];
+        this.Config.favsymbols ??= [];
+        this.Config.History ??= [];
+        this.Config.ToggleHotkey ??= [VirtualKey.MENU, VirtualKey.S];
+
+        if (this.Config.favsymbols.Count == 0 && this.Config.FavoriteSymbols.Count > 0)
         {
-            HelpMessage = "Open Quick Symbols.",
-            ShowInHelp = true,
-        };
+            this.Config.favsymbols = this.Config.FavoriteSymbols.ToList();
+        }
+        else if (this.Config.FavoriteSymbols.Count == 0 && this.Config.favsymbols.Count > 0)
+        {
+            this.Config.FavoriteSymbols = this.Config.favsymbols.ToList();
+        }
 
-        CommandManager.AddHandler(CommandShort, commandInfo);
-        CommandManager.AddHandler(CommandLong, commandInfo);
-
-        Log.Information("QuickSymbols loaded.");
+        if (!this.Config.HasCustombPosition && this.Config.HasCustomButtonPosition)
+        {
+            this.Config.HasCustombPosition = true;
+            this.Config.bPosition = this.Config.ButtonPosition;
+        }
+        else if (!this.Config.HasCustomButtonPosition && this.Config.HasCustombPosition)
+        {
+            this.Config.HasCustomButtonPosition = true;
+            this.Config.ButtonPosition = this.Config.bPosition;
+        }
     }
 
     public void Dispose()
     {
+        Framework.Update -= this.FrameworkUpdate;
+        PluginInterface.UiBuilder.OpenConfigUi -= this.OpenConfigWindow;
+        PluginInterface.UiBuilder.OpenMainUi -= this.OpenMainWindow;
+        PluginInterface.UiBuilder.Draw -= this.Draw;
+
         CommandManager.RemoveHandler(CommandShort);
         CommandManager.RemoveHandler(CommandLong);
-        PluginInterface.UiBuilder.Draw -= this.Draw;
-        this.symbolFont.Dispose();
+        CommandManager.RemoveHandler(CommandConfig);
+
+        this.symbolFont?.Dispose();
+        this.keybindTextInput = null;
+        this.SaveConfig();
+    }
+
+    private void RegisterCommand(string command, string helpMessage)
+    {
+        if (CommandManager.Commands.ContainsKey(command))
+        {
+            Log.Warning($"Quick Symbols skipped registering command {command} because it is already registered.");
+            return;
+        }
+
+        CommandManager.AddHandler(command, new CommandInfo(this.OnCommand)
+        {
+            HelpMessage = helpMessage,
+            ShowInHelp = true,
+        });
     }
 
     private void OnCommand(string command, string args)
     {
+        if (command.Equals(CommandConfig, StringComparison.OrdinalIgnoreCase) || args.Trim().Equals("config", StringComparison.OrdinalIgnoreCase))
+        {
+            this.configWindowOpen = true;
+            return;
+        }
+
         this.popupOpen = true;
+        this.selectedPopupTab = PopupTab.Symbols;
+    }
+
+    private void OpenConfigWindow()
+    {
+        this.configWindowOpen = true;
+    }
+
+    private void OpenMainWindow()
+    {
+        this.configWindowOpen = true;
+    }
+
+    private void DrawConfigWindow()
+    {
+        if (!this.configWindowOpen)
+        {
+            return;
+        }
+
+        var changed = false;
+        ImGui.SetNextWindowSize(new Vector2(460f * ImGuiHelpers.GlobalScale, 360f * ImGuiHelpers.GlobalScale), ImGuiCond.FirstUseEver);
+        if (ImGui.Begin("Quick Symbols Config", ref this.configWindowOpen, ImGuiWindowFlags.NoCollapse))
+        {
+            this.DrawConfig(ref changed);
+        }
+
+        ImGui.End();
+
+        if (changed)
+        {
+            this.SaveConfig();
+        }
+    }
+
+    private void SaveConfig()
+    {
+        this.ConfigChanged();
+        PluginInterface.SavePluginConfig(this.Config);
+    }
+
+    private bool CheckHotkeyState(VirtualKey[] keys)
+    {
+        this.CheckHotkeyEditorSafety();
+        if (this.hotkeyRecording || keys.Length == 0)
+        {
+            this.hotkeyWasDown = false;
+            return false;
+        }
+
+        foreach (var vk in KeyState.GetValidVirtualKeys())
+        {
+            if (keys.Contains(vk))
+            {
+                if (!KeyState[vk])
+                {
+                    this.hotkeyWasDown = false;
+                    return false;
+                }
+            }
+            else if (KeyState[vk])
+            {
+                this.hotkeyWasDown = false;
+                return false;
+            }
+        }
+
+        if (this.hotkeyWasDown)
+        {
+            return false;
+        }
+
+        this.hotkeyWasDown = true;
+        foreach (var key in keys)
+        {
+            KeyState[(int)key] = false;
+        }
+
+        return true;
+    }
+
+    private bool DrawHotkeyConfigEditor(string label, VirtualKey[] keys, out VirtualKey[] outKeys)
+    {
+        outKeys = [];
+        var changed = false;
+        var hotkeyText = this.hotkeyRecording
+            ? string.Join("+", this.pendingHotkey.Select(GetKeyName))
+            : string.Join("+", keys.Select(GetKeyName));
+
+        if (string.IsNullOrWhiteSpace(hotkeyText))
+        {
+            hotkeyText = this.hotkeyRecording ? "Press keys..." : "None";
+        }
+
+        ImGui.SetNextItemWidth(140f * ImGuiHelpers.GlobalScale);
+        using (ImRaii.PushStyle(ImGuiStyleVar.FrameBorderSize, 2f))
+        using (ImRaii.PushColor(ImGuiCol.Border, 0xFF00A5FF, this.hotkeyRecording))
+        {
+            ImGui.InputText(label, ref hotkeyText, 100, ImGuiInputTextFlags.ReadOnly);
+        }
+
+        if (this.hotkeyRecording)
+        {
+            this.CaptureHotkeyInput();
+            if (!this.hotkeyFocused)
+            {
+                ImGui.SetKeyboardFocusHere(-1);
+                this.hotkeyFocused = true;
+            }
+
+            ImGui.SameLine();
+            if (ImGui.Button(this.pendingHotkey.Count > 0 ? "Confirm##QuickSymbolsHotkeyConfirm" : "Cancel##QuickSymbolsHotkeyCancel"))
+            {
+                this.hotkeyRecording = false;
+                this.hotkeyFocused = false;
+                this.hotkeySafety.Reset();
+
+                if (this.pendingHotkey.Count > 0)
+                {
+                    outKeys = this.pendingHotkey.OrderBy(k => (int)k).ToArray();
+                    changed = true;
+                }
+
+                this.pendingHotkey.Clear();
+            }
+        }
+        else
+        {
+            ImGui.SameLine();
+            if (ImGui.Button("Set Keybind##QuickSymbolsSetHotkey"))
+            {
+                this.hotkeyRecording = true;
+                this.hotkeyFocused = false;
+                this.pendingHotkey.Clear();
+                this.hotkeySafety.Restart();
+            }
+        }
+
+        return changed;
+    }
+
+    private void CaptureHotkeyInput()
+    {
+        this.CheckHotkeyEditorSafety();
+        var io = ImGui.GetIO();
+
+        if (io.KeyAlt && !this.pendingHotkey.Contains(VirtualKey.MENU))
+        {
+            this.pendingHotkey.Add(VirtualKey.MENU);
+        }
+
+        if (io.KeyShift && !this.pendingHotkey.Contains(VirtualKey.SHIFT))
+        {
+            this.pendingHotkey.Add(VirtualKey.SHIFT);
+        }
+
+        if (io.KeyCtrl && !this.pendingHotkey.Contains(VirtualKey.CONTROL))
+        {
+            this.pendingHotkey.Add(VirtualKey.CONTROL);
+        }
+
+        for (var key = 0; key < io.KeysDown.Length && key < 160; key++)
+        {
+            if (!io.KeysDown[key])
+            {
+                continue;
+            }
+
+            var virtualKey = (VirtualKey)key;
+            if (virtualKey == VirtualKey.ESCAPE)
+            {
+                this.hotkeyRecording = false;
+                this.hotkeyFocused = false;
+                this.pendingHotkey.Clear();
+                this.hotkeySafety.Reset();
+                return;
+            }
+
+            if (!this.pendingHotkey.Contains(virtualKey))
+            {
+                this.pendingHotkey.Add(virtualKey);
+            }
+        }
+    }
+
+    private void CheckHotkeyEditorSafety()
+    {
+        if (this.hotkeySafety.IsRunning && this.hotkeySafety.ElapsedMilliseconds > 5000)
+        {
+            this.hotkeyRecording = false;
+            this.hotkeyFocused = false;
+            this.pendingHotkey.Clear();
+            this.hotkeySafety.Reset();
+        }
+    }
+
+    private static string GetKeyName(VirtualKey key)
+    {
+        return key switch
+        {
+            VirtualKey.KEY_0 => "0",
+            VirtualKey.KEY_1 => "1",
+            VirtualKey.KEY_2 => "2",
+            VirtualKey.KEY_3 => "3",
+            VirtualKey.KEY_4 => "4",
+            VirtualKey.KEY_5 => "5",
+            VirtualKey.KEY_6 => "6",
+            VirtualKey.KEY_7 => "7",
+            VirtualKey.KEY_8 => "8",
+            VirtualKey.KEY_9 => "9",
+            VirtualKey.CONTROL => "Ctrl",
+            VirtualKey.MENU => "Alt",
+            VirtualKey.SHIFT => "Shift",
+            _ => key.ToString(),
+        };
+    }
+
+    private void DrawConfig(ref bool hasChanged)
+    {
+        this.ConfigChanged();
+
+        if (this.DrawHotkeyConfigEditor("Toggle Character Selector", this.Config.ToggleHotkey, out var newKeys))
+        {
+            this.Config.ToggleHotkey = newKeys;
+            hasChanged = true;
+        }
+
+        ImGui.Spacing();
+        if (ImGui.CollapsingHeader($"Custom Entries ({this.Config.Custom.Count})###cEntriesHeader", ImGuiTreeNodeFlags.DefaultOpen))
+        {
+            var delete = -1;
+            using (ImRaii.PushStyle(ImGuiStyleVar.ItemSpacing, new Vector2(4f * ImGuiHelpers.GlobalScale, ImGui.GetStyle().ItemSpacing.Y)))
+            {
+                for (var i = 0; i < this.Config.Custom.Count; i++)
+                {
+                    if (ImGui.SmallButton($"{(char)SeIconChar.Cross}##deleteCustom{i}"))
+                    {
+                        delete = i;
+                    }
+
+                    ImGui.SameLine();
+                    ImGui.SetNextItemWidth(Math.Max(180f, ImGui.GetContentRegionAvail().X));
+                    var val = this.Config.Custom[i];
+                    if (ImGui.InputText($"##custom_{i}", ref val, 128))
+                    {
+                        this.Config.Custom[i] = val;
+                        hasChanged = true;
+                    }
+
+                    if (string.IsNullOrWhiteSpace(val) && !ImGui.IsItemActive())
+                    {
+                        delete = i;
+                    }
+                }
+
+                if (delete >= 0)
+                {
+                    this.Config.Custom.RemoveAt(delete);
+                    hasChanged = true;
+                }
+
+                ImGui.Separator();
+                ImGui.SetNextItemWidth(Math.Max(180f, ImGui.GetContentRegionAvail().X - 76f * ImGuiHelpers.GlobalScale));
+                ImGui.InputText("##newCustomEntry", ref this.newCustomEntry, 128);
+                ImGui.SameLine();
+                if (ImGui.SmallButton("+ Add##addCustomEntry"))
+                {
+                    var entry = this.newCustomEntry.Trim();
+                    if (!string.IsNullOrWhiteSpace(entry))
+                    {
+                        this.Config.Custom.Add(entry);
+                        this.newCustomEntry = string.Empty;
+                        hasChanged = true;
+                    }
+                }
+            }
+        }
+    }
+
+    private void FrameworkUpdate(IFramework framework)
+    {
+        if (!this.CheckHotkeyState(this.Config.ToggleHotkey))
+        {
+            return;
+        }
+
+        if (this.keybindPopupOpen)
+        {
+            this.keybindPopupOpen = false;
+            this.keybindTextInput = null;
+            return;
+        }
+
+        var focused = GetFocusedTextInput();
+        if (focused == null)
+        {
+            return;
+        }
+
+        var scale = ImGuiHelpers.GlobalScale;
+        this.keybindTextInput = focused;
+        this.keybindPopupAnchorSize = new Vector2(Math.Clamp(24f * scale, 18f * scale, 28f * scale));
+        this.keybindPopupAnchorPos = ClampPositionToScreen(ImGui.GetIO().MousePos + new Vector2(12f * scale, 12f * scale), this.keybindPopupAnchorSize);
+        this.selectedPopupTab = PopupTab.Symbols;
+        this.keybindPopupOpen = true;
+    }
+
+    private static AtkComponentTextInput* GetFocusedTextInput()
+    {
+        var atkStage = AtkStage.Instance();
+        if (atkStage == null)
+        {
+            return null;
+        }
+
+        var focus = atkStage->GetFocus();
+        var node = focus;
+        // Try to move up the hierarchy to find the input
+        for (var i = 0; node != null && i < 8; i++)
+        {
+            var input = node->GetAsAtkComponentTextInput();
+            if (input != null && input->Enabled)
+            {
+                return input;
+            }
+
+            node = node->ParentNode;
+        }
+
+        if (focus == null || focus->ParentNode == null)
+        {
+            return null;
+        }
+
+        var focusParentComponent = focus->ParentNode->GetComponent();
+        if (focusParentComponent == null)
+        {
+            return null;
+        }
+
+        var componentInfo = (AtkUldComponentInfo*)focusParentComponent->UldManager.Objects;
+        if (componentInfo == null || componentInfo->ComponentType != ComponentType.TextInput)
+        {
+            return null;
+        }
+
+        return (AtkComponentTextInput*)focusParentComponent;
     }
 
     private void Draw()
     {
+        this.DrawConfigWindow();
+
         if (GameGui.GameUiHidden)
         {
             return;
         }
 
-        var gameTheme = GetCurrentGameUiTheme();
-        var colors = UiColors.FromGameTheme(gameTheme, null);
-        var drawChatPopup = false;
-        var drawPartyFinderPopup = false;
-        var drawMessageBookPopup = false;
+        var Theme = GetCurrentGameUiTheme();
+        var colors = UiColors.FromGameTheme(Theme, null);
+        var ChatPopup = false;
+        var PartyFinderPopup = false;
+        var MsgBookPopup = false;
 
-        if (this.TryGetNativeChatButtonPlacement(out var nativePos, out var nativeSize, out colors))
+        // Chat Log button
+        if (this.TryGetNativeChatButtonPlacement(out var nPos, out var nSize, out colors))
         {
-            this.nativeButtonPos = nativePos;
-            this.currentButtonSize = nativeSize;
-            this.currentButtonPos = this.GetCurrentButtonPosition(nativePos, nativeSize);
+            this.nativebPos = nPos;
+            this.currentbSize = nSize;
+            this.currentbPos = this.GetCurrentbPosition(nPos, nSize);
 
-            this.DrawChatButton(this.currentButtonPos, nativeSize, colors);
-            drawChatPopup = this.popupOpen;
+            this.DrawChatButton(this.currentbPos, nSize, colors);
+            ChatPopup = this.popupOpen;
         }
         else
         {
             this.popupOpen = false;
-            this.editButtonPosition = false;
+            this.editbPosition = false;
         }
-
-        if (this.TryGetRecruitmentCommentTarget(out var recruitmentTarget))
+        // Party Finder button
+        if (this.TryGetRecruitmentCommentTarget(out var pfTarget))
         {
             var scale = ImGuiHelpers.GlobalScale;
-
-            // Keep the Party Finder heart button visually small, like the chat button.
-            // It still follows the Comment field position/scale, but it should not grow
-            // into a large square when the native Comment box is resized taller.
-            var referenceSide = this.currentButtonSize.Y > 0.1f ? this.currentButtonSize.Y : 24f * scale;
-            var buttonSide = Math.Clamp(Math.Min(referenceSide, recruitmentTarget.Size.Y * 0.50f), 18f * scale, 28f * scale);
-            this.partyFinderButtonSize = new Vector2(buttonSide, buttonSide);
-            this.partyFinderButtonPos = ClampPositionToScreen(
-                new Vector2(
-                    recruitmentTarget.Position.X + 6f * scale,
-                    recruitmentTarget.Position.Y + recruitmentTarget.Size.Y + 2f * scale),
-                this.partyFinderButtonSize);
+            var refSide = this.currentbSize.Y > 0.1f ? this.currentbSize.Y : 24f * scale;
+            var Side = Math.Clamp(Math.Min(refSide, pfTarget.Size.Y * 0.50f), 18f * scale, 28f * scale);
+            this.partyFinderbSize = new Vector2(Side, Side);
+            this.partyFinderbPos = ClampPositionToScreen(
+                new Vector2(pfTarget.Position.X + 6f * scale, pfTarget.Position.Y + pfTarget.Size.Y + 2f * scale),
+                this.partyFinderbSize);
 
             this.DrawContextButton(
                 "##QuickSymbolsRecruitmentCommentButtonOverlay",
                 "##QuickSymbolsRecruitmentCommentOpenButton",
-                this.partyFinderButtonPos,
-                this.partyFinderButtonSize,
+                this.partyFinderbPos,
+                this.partyFinderbSize,
                 colors,
                 ref this.partyFinderPopupOpen);
-            drawPartyFinderPopup = this.partyFinderPopupOpen;
+            PartyFinderPopup = this.partyFinderPopupOpen;
         }
         else
         {
             this.partyFinderPopupOpen = false;
         }
-
+        // Guestbook/Message Book button
         if (this.TryGetMessageBookInputTarget(out var messageTarget))
         {
             var scale = ImGuiHelpers.GlobalScale;
-            var referenceSide = this.currentButtonSize.Y > 0.1f ? this.currentButtonSize.Y : 24f * scale;
-            var buttonSide = Math.Clamp(Math.Min(referenceSide, messageTarget.Size.Y * 0.58f), 18f * scale, 28f * scale);
-            this.messageBookButtonSize = new Vector2(buttonSide, buttonSide);
-            this.messageBookButtonPos = ClampPositionToScreen(
-                new Vector2(
-                    messageTarget.Position.X + 6f * scale,
-                    messageTarget.Position.Y + messageTarget.Size.Y + 3f * scale),
-                this.messageBookButtonSize);
+            var refSide = this.currentbSize.Y > 0.1f ? this.currentbSize.Y : 24f * scale;
+            var Side = Math.Clamp(Math.Min(refSide, messageTarget.Size.Y * 0.58f), 18f * scale, 28f * scale);
+            this.messageBookbSize = new Vector2(Side, Side);
+            this.messageBookbPos = ClampPositionToScreen(
+                new Vector2(messageTarget.Position.X + 6f * scale, messageTarget.Position.Y + messageTarget.Size.Y + 3f * scale),
+                this.messageBookbSize);
 
             this.DrawContextButton(
                 "##QuickSymbolsMessageBookButtonOverlay",
                 "##QuickSymbolsMessageBookOpenButton",
-                this.messageBookButtonPos,
-                this.messageBookButtonSize,
+                this.messageBookbPos,
+                this.messageBookbSize,
                 colors,
                 ref this.messageBookPopupOpen);
-            drawMessageBookPopup = this.messageBookPopupOpen;
+            MsgBookPopup = this.messageBookPopupOpen;
         }
         else
         {
             this.messageBookPopupOpen = false;
         }
-
-        // Draw popups after every overlay button so they stay visually above the
-        // plugin's own buttons and capture clicks before the game UI underneath.
-        if (drawChatPopup)
+        // Popup Rendering
+        if (ChatPopup)
         {
             this.DrawSymbolsPopup(
                 "Chat",
                 colors,
-                this.currentButtonPos,
-                this.currentButtonSize,
-                PopupPlacement.AboveRight,
-                includePositionEditor: true,
-                SymbolInsertTarget.Chat,
-                ref this.popupOpen);
+                this.currentbPos,
+                this.currentbSize,
+                PopupPlacement.AboveRight, includePositionEditor: true, SymbolInsertTarget.Chat, ref this.popupOpen);
         }
 
-        if (drawPartyFinderPopup)
+        if (PartyFinderPopup)
         {
             this.DrawSymbolsPopup(
                 "PartyFinder",
                 colors,
-                this.partyFinderButtonPos,
-                this.partyFinderButtonSize,
-                PopupPlacement.Below,
-                includePositionEditor: false,
-                SymbolInsertTarget.RecruitmentComment,
-                ref this.partyFinderPopupOpen);
+                this.partyFinderbPos,
+                this.partyFinderbSize,
+                PopupPlacement.Below, includePositionEditor: false, SymbolInsertTarget.RecruitmentComment, ref this.partyFinderPopupOpen);
         }
 
-        if (drawMessageBookPopup)
+        if (MsgBookPopup)
         {
             this.DrawSymbolsPopup(
                 "MessageBook",
                 colors,
-                this.messageBookButtonPos,
-                this.messageBookButtonSize,
-                PopupPlacement.Below,
-                includePositionEditor: false,
-                SymbolInsertTarget.MessageBookInput,
-                ref this.messageBookPopupOpen);
+                this.messageBookbPos,
+                this.messageBookbSize, PopupPlacement.Below, includePositionEditor: false, SymbolInsertTarget.MessageBookInput, ref this.messageBookPopupOpen);
+        }
+
+        if (this.keybindPopupOpen)
+        {
+            this.DrawSymbolsPopup(
+                "Keybind",
+                colors,
+                this.keybindPopupAnchorPos,
+                this.keybindPopupAnchorSize, PopupPlacement.Below, includePositionEditor: false, SymbolInsertTarget.FocusedTextInput, ref this.keybindPopupOpen);
         }
     }
 
-    private Vector2 GetCurrentButtonPosition(Vector2 nativePos, Vector2 nativeSize)
+    private Vector2 GetCurrentbPosition(Vector2 nPos, Vector2 nSize)
     {
-        if (!this.configuration.HasCustomButtonPosition)
+        if (!this.Config.HasCustombPosition)
         {
-            return nativePos;
+            return nPos;
         }
 
-        if (!this.configuration.UsesRelativeButtonOffset)
+        if (!this.Config.UsesRelativeButtonOffset)
         {
-            this.configuration.ButtonOffset = this.configuration.ButtonPosition - nativePos;
-            this.configuration.UsesRelativeButtonOffset = true;
-            this.buttonPositionDirty = true;
+            this.Config.ButtonOffset = this.Config.bPosition - nPos;
+            this.Config.UsesRelativeButtonOffset = true;
+            this.bPositionDirty = true;
         }
 
-        var desired = nativePos + this.configuration.ButtonOffset;
-        var clamped = ClampPositionToScreen(desired, nativeSize);
+        var desired = nPos + this.Config.ButtonOffset;
+        var clamped = ClampPositionToScreen(desired, nSize);
+
         if (Vector2.DistanceSquared(desired, clamped) > 0.01f)
         {
-            this.configuration.ButtonOffset = clamped - nativePos;
-            this.configuration.ButtonPosition = clamped;
-            this.buttonPositionDirty = true;
+            this.Config.ButtonOffset = clamped - nPos;
+            this.Config.bPosition = clamped;
+            this.bPositionDirty = true;
         }
 
         this.SaveConfigurationIfDirty();
         return clamped;
     }
 
-    private bool TryGetNativeChatButtonPlacement(out Vector2 buttonPos, out Vector2 buttonSize, out UiColors colors)
+    private bool TryGetNativeChatButtonPlacement(out Vector2 bPos, out Vector2 bSize, out UiColors colors)
     {
-        buttonPos = Vector2.Zero;
-        buttonSize = Vector2.Zero;
+        bPos = Vector2.Zero;
+        bSize = Vector2.Zero;
         colors = UiColors.Default;
 
         var chatUnit = GameGui.GetAddonByName(ChatLogAddonName);
@@ -300,44 +737,46 @@ public sealed unsafe class Plugin : IDalamudPlugin
 
         colors = UiColors.FromGameTheme(GetCurrentGameUiTheme(), chatLog);
 
-        var unitScale = Math.Clamp(chatUnit.Scale, 0.65f, 2.4f);
-        var gap = Math.Max(2f, 2f * unitScale);
+        var scale = Math.Clamp(chatUnit.Scale, 0.65f, 2.4f);
+        var gap = Math.Max(2f, 2f * scale);
 
+        //Try to find the channel dropdown
         if (chatLog->ChannelSelectDropDown != null)
         {
-            var channelNode = chatLog->ChannelSelectDropDown->AtkComponentBase.OwnerNode;
-            if (channelNode != null && channelNode->AtkResNode.IsVisible())
+            var node = chatLog->ChannelSelectDropDown->AtkComponentBase.OwnerNode;
+            if (node != null && node->AtkResNode.IsVisible())
             {
-                var resNode = &channelNode->AtkResNode;
-                var nodeHeight = GetNodeScreenSize(resNode, unitScale).Y;
-                var square = Math.Clamp(nodeHeight, 18f * unitScale, 28f * unitScale);
+                var res = &node->AtkResNode;
+                var nodeHeight = GetNodeScreenSize(res, scale).Y;
+                var sq = Math.Clamp(nodeHeight, 18f * scale, 28f * scale);
 
-                buttonSize = new Vector2(square, square);
-                buttonPos = new Vector2(
-                    resNode->ScreenX - square - gap,
-                    resNode->ScreenY + Math.Max(0f, (nodeHeight - square) * 0.5f));
+                bSize = new Vector2(sq, sq);
+                bPos = new Vector2(
+                    res->ScreenX - sq - gap,
+                    res->ScreenY + Math.Max(0f, (nodeHeight - sq) * 0.5f));
                 return true;
             }
         }
 
         if (chatLog->CurrentChannelTextNode != null && chatLog->CurrentChannelTextNode->AtkResNode.IsVisible())
         {
-            var resNode = &chatLog->CurrentChannelTextNode->AtkResNode;
-            var nodeHeight = GetNodeScreenSize(resNode, unitScale).Y;
-            var square = Math.Clamp(nodeHeight + 8f * unitScale, 18f * unitScale, 28f * unitScale);
+            var res = &chatLog->CurrentChannelTextNode->AtkResNode;
+            var h = GetNodeScreenSize(res, scale).Y;
+            var sq = Math.Clamp(h + 8f * scale, 18f * scale, 28f * scale);
 
-            buttonSize = new Vector2(square, square);
-            buttonPos = new Vector2(
-                resNode->ScreenX - square - gap,
-                resNode->ScreenY - 4f * unitScale);
+            bSize = new Vector2(sq, sq);
+            bPos = new Vector2(
+                res->ScreenX - sq - gap,
+                res->ScreenY - 4f * scale);
             return true;
         }
 
-        var fallbackSize = Math.Clamp(24f * unitScale, 18f, 32f * unitScale);
-        buttonSize = new Vector2(fallbackSize, fallbackSize);
-        buttonPos = new Vector2(
-            chatUnit.Position.X + 4f * unitScale,
-            chatUnit.Position.Y + chatUnit.ScaledSize.Y - fallbackSize - 4f * unitScale);
+        // Last resort: bottom left corner
+        var fSize = Math.Clamp(24f * scale, 18f, 32f * scale);
+        bSize = new Vector2(fSize, fSize);
+        bPos = new Vector2(
+            chatUnit.Position.X + 4f * scale,
+            chatUnit.Position.Y + chatUnit.ScaledSize.Y - fSize - 4f * scale);
         return true;
     }
 
@@ -345,14 +784,10 @@ public sealed unsafe class Plugin : IDalamudPlugin
     {
         var clicked = this.DrawHeartButtonOverlay(
             "##QuickSymbolsChatButtonOverlay",
-            "##QuickSymbolsOpenButton",
-            position,
-            size,
-            colors,
-            this.editButtonPosition,
-            out var active);
+            "##QuickSymbolsOpenButton", position, size, colors,
+            this.editbPosition, out var active);
 
-        if (this.editButtonPosition)
+        if (this.editbPosition)
         {
             this.HandleButtonDragging(size, active);
         }
@@ -364,14 +799,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
 
     private void DrawContextButton(string windowId, string buttonId, Vector2 position, Vector2 size, UiColors colors, ref bool isOpen)
     {
-        if (this.DrawHeartButtonOverlay(
-                windowId,
-                buttonId,
-                position,
-                size,
-                colors,
-                editing: false,
-                out _))
+        if (this.DrawHeartButtonOverlay(windowId, buttonId, position, size, colors, editing: false, out _))
         {
             isOpen = !isOpen;
         }
@@ -394,16 +822,16 @@ public sealed unsafe class Plugin : IDalamudPlugin
         active = false;
         var beginCalled = false;
 
-        using var windowPadding = ImRaii.PushStyle(ImGuiStyleVar.WindowPadding, Vector2.Zero);
-        using var windowBorder = ImRaii.PushStyle(ImGuiStyleVar.WindowBorderSize, 0f);
-        using var windowRounding = ImRaii.PushStyle(ImGuiStyleVar.WindowRounding, 0f);
-        using var windowBackground = ImRaii.PushColor(ImGuiCol.WindowBg, Vector4.Zero);
+        using var wPadding = ImRaii.PushStyle(ImGuiStyleVar.WindowPadding, Vector2.Zero);
+        using var wBorder = ImRaii.PushStyle(ImGuiStyleVar.WindowBorderSize, 0f);
+        using var wRounding = ImRaii.PushStyle(ImGuiStyleVar.WindowRounding, 0f);
+        using var wBackground = ImRaii.PushColor(ImGuiCol.WindowBg, Vector4.Zero);
 
         try
         {
-            var windowVisible = ImGui.Begin(windowId, flags);
+            var wVisible = ImGui.Begin(windowId, flags);
             beginCalled = true;
-            if (windowVisible)
+            if (wVisible)
             {
                 var drawList = ImGui.GetWindowDrawList();
                 var min = ImGui.GetWindowPos();
@@ -432,7 +860,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
                 IDisposable? pushedFont = null;
                 try
                 {
-                    if (this.symbolFont.Available)
+                    if (this.symbolFont is { Available: true })
                     {
                         pushedFont = this.symbolFont.Push();
                     }
@@ -469,13 +897,13 @@ public sealed unsafe class Plugin : IDalamudPlugin
         if (active && ImGui.IsMouseDragging(ImGuiMouseButton.Left))
         {
             this.draggingButton = true;
-            var clamped = ClampPositionToScreen(this.currentButtonPos + io.MouseDelta, size);
-            this.configuration.HasCustomButtonPosition = true;
-            this.configuration.UsesRelativeButtonOffset = true;
-            this.configuration.ButtonPosition = clamped;
-            this.configuration.ButtonOffset = clamped - this.nativeButtonPos;
-            this.currentButtonPos = clamped;
-            this.buttonPositionDirty = true;
+            var clamped = ClampPositionToScreen(this.currentbPos + io.MouseDelta, size);
+            this.Config.HasCustombPosition = true;
+            this.Config.UsesRelativeButtonOffset = true;
+            this.Config.bPosition = clamped;
+            this.Config.ButtonOffset = clamped - this.nativebPos;
+            this.currentbPos = clamped;
+            this.bPositionDirty = true;
         }
         else if (this.draggingButton && !ImGui.IsMouseDown(ImGuiMouseButton.Left))
         {
@@ -485,31 +913,31 @@ public sealed unsafe class Plugin : IDalamudPlugin
     }
 
     private void DrawSymbolsPopup(
-        string idSuffix,
-        UiColors colors,
-        Vector2 anchorPos,
-        Vector2 anchorSize,
-        PopupPlacement placement,
-        bool includePositionEditor,
-        SymbolInsertTarget insertTarget,
-        ref bool isOpen)
+        string idSuffix, UiColors colors, Vector2 anchorPos, Vector2 anchorSize, PopupPlacement placement,
+        bool includePositionEditor, SymbolInsertTarget insertTarget, ref bool isOpen)
     {
+        this.ConfigChanged();
+
+        var cEntries = this.GetcEntries();
         var scale = ImGuiHelpers.GlobalScale;
-        var displaySize = ImGui.GetIO().DisplaySize;
+        var dSize = ImGui.GetIO().DisplaySize;
         var cell = Math.Clamp(anchorSize.Y * 1.05f, 22f * scale, 34f * scale);
         var spacing = Math.Max(3f, 4f * scale);
         var padding = Math.Max(8f, 10f * scale);
-        var scrollBarWidth = Math.Max(3f, 4f * scale);
-        var availableWidth = displaySize.X - 16f * scale;
-        var columns = Math.Clamp((int)((availableWidth - padding * 2f - scrollBarWidth - 8f * scale + spacing) / (cell + spacing)), 1, MaxColumns);
-        var totalRows = (int)Math.Ceiling(Symbols.Length / (double)columns);
-        var visibleRows = Math.Min(totalRows, 8);
-        var headerHeight = 26f * scale;
-        var keptChatEditorSpace = includePositionEditor ? 28f * scale : 0f;
+        var scrollWidth = Math.Max(3f, 4f * scale);
+        var availableWidth = dSize.X - 16f * scale;
+
+        // Grid Calc | Keep the popup dimensions tied to the normal Symbols tab. Custom entries can scroll inside the same space but they should never resize the window
+        var columns = Math.Clamp((int)((availableWidth - padding * 2f - scrollWidth - 8f * scale + spacing) / (cell + spacing)), 1, MaxColumns);
+        var sRows = Math.Max(1, (int)Math.Ceiling(Symbols.Length / (double)columns));
+        var visibleRows = Math.Min(sRows, 8);
         var gridWidth = columns * cell + Math.Max(0, columns - 1) * spacing;
-        var originalGridHeight = visibleRows * cell + Math.Max(0, visibleRows - 1) * spacing;
-        var popupWidth = Math.Min(availableWidth, padding * 2f + gridWidth + scrollBarWidth + 8f * scale);
-        var popupHeight = padding * 2f + headerHeight + keptChatEditorSpace + 8f * scale + originalGridHeight;
+        var gridHeight = visibleRows * cell + Math.Max(0, visibleRows - 1) * spacing;
+        var headerHeight = 24f * scale;
+        var tabHeight = 22f * scale;
+        var contentGap = 3f * scale;
+        var pWidth = Math.Min(availableWidth, padding * 2f + gridWidth + scrollWidth + 8f * scale);
+        var pHeight = padding * 2f + headerHeight + tabHeight + contentGap + gridHeight;
 
         float posX;
         float posY;
@@ -521,14 +949,14 @@ public sealed unsafe class Plugin : IDalamudPlugin
         else
         {
             posX = anchorPos.X + anchorSize.X + 10f * scale;
-            posY = anchorPos.Y - popupHeight - 8f * scale;
+            posY = anchorPos.Y - pHeight - 8f * scale;
         }
 
-        posX = Math.Clamp(posX, 8f * scale, Math.Max(8f * scale, displaySize.X - popupWidth - 8f * scale));
-        posY = Math.Clamp(posY, 8f * scale, Math.Max(8f * scale, displaySize.Y - popupHeight - 8f * scale));
+        posX = Math.Clamp(posX, 8f * scale, Math.Max(8f * scale, dSize.X - pWidth - 8f * scale));
+        posY = Math.Clamp(posY, 8f * scale, Math.Max(8f * scale, dSize.Y - pHeight - 8f * scale));
 
         ImGui.SetNextWindowPos(new Vector2(posX, posY), ImGuiCond.Always);
-        ImGui.SetNextWindowSize(new Vector2(popupWidth, popupHeight), ImGuiCond.Always);
+        ImGui.SetNextWindowSize(new Vector2(pWidth, pHeight), ImGuiCond.Always);
 
         var flags = ImGuiWindowFlags.NoDecoration
                     | ImGuiWindowFlags.NoSavedSettings
@@ -542,11 +970,11 @@ public sealed unsafe class Plugin : IDalamudPlugin
 
         var beginCalled = false;
 
-        using var popupPadding = ImRaii.PushStyle(ImGuiStyleVar.WindowPadding, new Vector2(padding, padding));
-        using var popupBorderSize = ImRaii.PushStyle(ImGuiStyleVar.WindowBorderSize, 1f * scale);
-        using var popupRounding = ImRaii.PushStyle(ImGuiStyleVar.WindowRounding, 8f * scale);
-        using var popupBackground = ImRaii.PushColor(ImGuiCol.WindowBg, colors.PopupBackground);
-        using var popupBorder = ImRaii.PushColor(ImGuiCol.Border, colors.Border);
+        using var pPadding = ImRaii.PushStyle(ImGuiStyleVar.WindowPadding, new Vector2(padding, padding));
+        using var pBorderSize = ImRaii.PushStyle(ImGuiStyleVar.WindowBorderSize, 1f * scale);
+        using var pRounding = ImRaii.PushStyle(ImGuiStyleVar.WindowRounding, 8f * scale);
+        using var pBackground = ImRaii.PushColor(ImGuiCol.WindowBg, colors.PopupBackground);
+        using var pBorder = ImRaii.PushColor(ImGuiCol.Border, colors.Border);
 
         try
         {
@@ -554,33 +982,33 @@ public sealed unsafe class Plugin : IDalamudPlugin
             beginCalled = true;
             if (windowVisible)
             {
-                var windowPos = ImGui.GetWindowPos();
+                var wPos = ImGui.GetWindowPos();
                 var drawList = ImGui.GetWindowDrawList();
                 var title = "Bryer - Quick Symbols";
                 ImGui.TextColored(colors.MutedText, title);
 
                 var closeSize = new Vector2(22f * scale, 22f * scale);
-                var closePos = new Vector2(windowPos.X + popupWidth - padding - closeSize.X, windowPos.Y + padding - 1f * scale);
+                var closePos = new Vector2(wPos.X + pWidth - padding - closeSize.X, wPos.Y + padding - 1f * scale);
 
                 if (includePositionEditor)
                 {
-                    var editLabel = this.editButtonPosition ? "Editing button position" : "Change button position";
-                    var editButtonSize = new Vector2(
+                    var editLabel = this.editbPosition ? "Editing button position" : "Change button position";
+                    var editbSize = new Vector2(
                         Math.Min(
                             Math.Max(126f * scale, ImGui.CalcTextSize(editLabel).X + 16f * scale),
-                            Math.Max(80f * scale, closePos.X - (windowPos.X + padding + ImGui.CalcTextSize(title).X + 12f * scale) - 6f * scale)),
+                            Math.Max(80f * scale, closePos.X - (wPos.X + padding + ImGui.CalcTextSize(title).X + 12f * scale) - 6f * scale)),
                         22f * scale);
-                    var editButtonPos = new Vector2(windowPos.X + padding + ImGui.CalcTextSize(title).X + 12f * scale, windowPos.Y + padding - 1f * scale);
+                    var editbPos = new Vector2(wPos.X + padding + ImGui.CalcTextSize(title).X + 12f * scale, wPos.Y + padding - 1f * scale);
 
-                    ImGui.SetCursorScreenPos(editButtonPos);
-                    using (ImRaii.PushColor(ImGuiCol.Button, this.editButtonPosition ? colors.EditButton : colors.Button))
-                    using (ImRaii.PushColor(ImGuiCol.ButtonHovered, this.editButtonPosition ? colors.EditButtonHovered : colors.ButtonHovered))
+                    ImGui.SetCursorScreenPos(editbPos);
+                    using (ImRaii.PushColor(ImGuiCol.Button, this.editbPosition ? colors.EditButton : colors.Button))
+                    using (ImRaii.PushColor(ImGuiCol.ButtonHovered, this.editbPosition ? colors.EditButtonHovered : colors.ButtonHovered))
                     using (ImRaii.PushColor(ImGuiCol.ButtonActive, colors.ButtonActive))
                     using (ImRaii.PushColor(ImGuiCol.Text, colors.Text))
                     {
-                        if (ImGui.Button(editLabel, editButtonSize))
+                        if (ImGui.Button(editLabel, editbSize))
                         {
-                            this.editButtonPosition = !this.editButtonPosition;
+                            this.editbPosition = !this.editbPosition;
                             this.draggingButton = false;
                             this.SaveConfigurationIfDirty();
                         }
@@ -591,26 +1019,53 @@ public sealed unsafe class Plugin : IDalamudPlugin
                 if (ImGui.InvisibleButton($"##QuickSymbolsCloseButton{idSuffix}", closeSize))
                 {
                     isOpen = false;
+                    if (idSuffix == "Keybind")
+                    {
+                        this.keybindTextInput = null;
+                    }
                 }
 
-                var closeHovered = ImGui.IsItemHovered();
-                drawList.AddRectFilled(closePos, closePos + closeSize, Color(closeHovered ? colors.CellHovered : colors.CellBackground), 4f * scale);
+                var cHover = ImGui.IsItemHovered();
+                drawList.AddRectFilled(closePos, closePos + closeSize, Color(cHover ? colors.CellHovered : colors.CellBackground), 4f * scale);
                 var xText = "X";
                 var xSize = ImGui.CalcTextSize(xText);
                 drawList.AddText(closePos + (closeSize - xSize) * 0.5f, Color(colors.Text), xText);
 
-                var contentStartY = windowPos.Y + padding + headerHeight + 6f * scale;
-                var contentHeight = popupHeight - padding - (contentStartY - windowPos.Y);
-                ImGui.SetCursorScreenPos(new Vector2(windowPos.X + padding, contentStartY));
+                var tabStartY = wPos.Y + padding + headerHeight;
+                ImGui.SetCursorScreenPos(new Vector2(wPos.X + padding, tabStartY));
+                this.DrawPopupTab("Symbols", PopupTab.Symbols, colors, tabHeight, scale);
+                ImGui.SameLine(0f, 6f * scale);
+                this.DrawPopupTab("Custom", PopupTab.Custom, colors, tabHeight, scale);
 
-                var favoritesHeight = this.DrawFavoritesSection(idSuffix, columns, cell, spacing, gridWidth, colors, insertTarget);
-                if (favoritesHeight > 0f)
+                var contentStartY = tabStartY + tabHeight + contentGap;
+                var contentHeight = pHeight - padding - (contentStartY - wPos.Y);
+                ImGui.SetCursorScreenPos(new Vector2(wPos.X + padding, contentStartY));
+
+                if (this.selectedPopupTab == PopupTab.Custom)
                 {
-                    ImGui.SetCursorScreenPos(new Vector2(windowPos.X + padding, contentStartY + favoritesHeight));
+                    if (cEntries.Count == 0)
+                    {
+                        ImGui.TextColored(colors.MutedText, "No custom entries configured yet - Type /qsconfig");
+                    }
+                    else
+                    {
+                        var customCellWidth = Math.Clamp(cEntries.Max(entry => ImGui.CalcTextSize(entry).X + 18f * scale), cell, gridWidth);
+                        var customColumns = Math.Clamp((int)((gridWidth + spacing) / (customCellWidth + spacing)), 1, columns);
+                        var customRows = Math.Max(1, (int)Math.Ceiling(cEntries.Count / (double)customColumns));
+                        this.DrawEntriesGrid(idSuffix, cEntries, customColumns, customRows, customCellWidth, cell, spacing, Math.Max(cell, contentHeight), scrollWidth, colors, insertTarget, ref this.customScrollY, allowfavs: false);
+                    }
                 }
+                else
+                {
+                    var favsHeight = this.DrawfavsSection(idSuffix, columns, cell, spacing, gridWidth, colors, insertTarget);
+                    if (favsHeight > 0f)
+                    {
+                        ImGui.SetCursorScreenPos(new Vector2(wPos.X + padding, contentStartY + favsHeight));
+                    }
 
-                var gridHeight = Math.Max(cell, contentHeight - favoritesHeight);
-                this.DrawSymbolsGrid(idSuffix, columns, totalRows, cell, spacing, gridHeight, scrollBarWidth, colors, insertTarget);
+                    var availableGridHeight = Math.Max(cell, contentHeight - favsHeight);
+                    this.DrawEntriesGrid(idSuffix, Symbols, columns, sRows, cell, cell, spacing, availableGridHeight, scrollWidth, colors, insertTarget, ref this.symbolScrollY, allowfavs: true);
+                }
             }
         }
         finally
@@ -622,67 +1077,101 @@ public sealed unsafe class Plugin : IDalamudPlugin
         }
     }
 
-    private float DrawFavoritesSection(string idSuffix, int columns, float cell, float spacing, float gridWidth, UiColors colors, SymbolInsertTarget insertTarget)
+    private void DrawPopupTab(string label, PopupTab tab, UiColors colors, float height, float scale)
     {
-        var favorites = this.GetFavoriteSymbols();
-        if (favorites.Count == 0)
+        var active = this.selectedPopupTab == tab;
+        using (ImRaii.PushColor(ImGuiCol.Button, active ? colors.ButtonActive : colors.Button))
+        using (ImRaii.PushColor(ImGuiCol.ButtonHovered, colors.ButtonHovered))
+        using (ImRaii.PushColor(ImGuiCol.ButtonActive, colors.ButtonActive))
+        using (ImRaii.PushColor(ImGuiCol.Text, colors.Text))
+        {
+            var width = Math.Max(72f * scale, ImGui.CalcTextSize(label).X + 18f * scale);
+            if (ImGui.Button($"{label}##QuickSymbolsTab{label}", new Vector2(width, height)))
+            {
+                this.selectedPopupTab = tab;
+            }
+        }
+    }
+
+    private IReadOnlyList<string> GetcEntries()
+    {
+        this.Config.Custom ??= [];
+        return this.Config.Custom.Where(s => !string.IsNullOrWhiteSpace(s)).Select(s => s.Trim()).Distinct().ToArray();
+    }
+
+    private float DrawfavsSection(string idSuffix, int columns, float cell, float spacing, float gridWidth, UiColors colors, SymbolInsertTarget insertTarget)
+    {
+        var favs = this.Getfavsymbols();
+        if (favs.Count == 0)
         {
             return 0f;
         }
 
         var scale = ImGuiHelpers.GlobalScale;
         var origin = ImGui.GetCursorScreenPos();
-        var drawList = ImGui.GetWindowDrawList();
+        var dList = ImGui.GetWindowDrawList();
         var label = "Favorites";
         var labelHeight = 20f * scale;
-        var rows = (int)Math.Ceiling(favorites.Count / (double)columns);
-        var favoritesGridHeight = rows * cell + Math.Max(0, rows - 1) * spacing;
-        var dividerY = origin.Y + labelHeight + favoritesGridHeight + 6f * scale;
+        var rows = (int)Math.Ceiling(favs.Count / (double)columns);
+        var favsGridHeight = rows * cell + Math.Max(0, rows - 1) * spacing;
+        var dividerY = origin.Y + labelHeight + favsGridHeight + 6f * scale;
 
         ImGui.TextColored(colors.MutedText, label);
 
         IDisposable? pushedFont = null;
-        if (this.symbolFont.Available)
+        if (this.symbolFont is { Available: true })
         {
             pushedFont = this.symbolFont.Push();
         }
 
-        for (var i = 0; i < favorites.Count; i++)
+        for (var i = 0; i < favs.Count; i++)
         {
             var row = i / columns;
             var col = i % columns;
             var cellMin = new Vector2(origin.X + col * (cell + spacing), origin.Y + labelHeight + row * (cell + spacing));
-            this.DrawSymbolCell(favorites[i], $"{idSuffix}-favorite-{i}", cellMin, cell, colors, isFavorite: true, insertTarget);
+            this.DrawSymbolCell(favs[i], $"{idSuffix}-favorite-{i}", cellMin, new Vector2(cell, cell), colors, isFavorite: true, insertTarget, allowFavoriteToggle: true);
         }
 
         pushedFont?.Dispose();
 
-        drawList.AddLine(
+        dList.AddLine(
             new Vector2(origin.X, dividerY),
             new Vector2(origin.X + gridWidth, dividerY),
             Color(colors.CellBorder),
             Math.Max(1f, scale));
 
-        var totalHeight = labelHeight + favoritesGridHeight + 12f * scale;
+        var totalHeight = labelHeight + favsGridHeight + 12f * scale;
         ImGui.SetCursorScreenPos(new Vector2(origin.X, origin.Y + totalHeight));
         return totalHeight;
     }
 
-    private void DrawSymbolsGrid(string idSuffix, int columns, int rows, float cell, float spacing, float gridHeight, float scrollBarWidth, UiColors colors, SymbolInsertTarget insertTarget)
+    private void DrawEntriesGrid(
+        string idSuffix,
+        IReadOnlyList<string> entries,
+        int columns,
+        int rows,
+        float cellWidth,
+        float cellHeight,
+        float spacing,
+        float gridHeight,
+        float scrollWidth,
+        UiColors colors, SymbolInsertTarget insertTarget,
+        ref float scrollY,
+        bool allowfavs)
     {
         var scale = ImGuiHelpers.GlobalScale;
-        var rowHeight = cell + spacing;
-        var gridWidth = columns * cell + Math.Max(0, columns - 1) * spacing;
-        var gridSize = new Vector2(gridWidth + scrollBarWidth + 8f * scale, gridHeight);
+        var rowHeight = cellHeight + spacing;
+        var gridWidth = columns * cellWidth + Math.Max(0, columns - 1) * spacing;
+        var gridSize = new Vector2(gridWidth + scrollWidth + 8f * scale, gridHeight);
         var maxScroll = Math.Max(0f, rows * rowHeight - spacing - gridHeight);
 
-        this.symbolScrollY = Math.Clamp(this.symbolScrollY, 0f, maxScroll);
+        scrollY = Math.Clamp(scrollY, 0f, maxScroll);
 
         var childFlags = ImGuiWindowFlags.NoScrollbar
                          | ImGuiWindowFlags.NoScrollWithMouse
                          | ImGuiWindowFlags.NoNav;
 
-        if (ImGui.BeginChild($"##QuickSymbolsGridChild{idSuffix}", gridSize, false, childFlags))
+        if (ImGui.BeginChild($"##QuickSymbolsGridChild{idSuffix}{this.selectedPopupTab}", gridSize, false, childFlags))
         {
             var childOrigin = ImGui.GetCursorScreenPos();
             var drawList = ImGui.GetWindowDrawList();
@@ -692,15 +1181,15 @@ public sealed unsafe class Plugin : IDalamudPlugin
                 var wheel = ImGui.GetIO().MouseWheel;
                 if (Math.Abs(wheel) > 0.01f)
                 {
-                    this.symbolScrollY = Math.Clamp(this.symbolScrollY - wheel * rowHeight * 2f, 0f, maxScroll);
+                    scrollY = Math.Clamp(scrollY - wheel * rowHeight * 2f, 0f, maxScroll);
                 }
             }
 
-            var firstRow = Math.Max(0, (int)Math.Floor(this.symbolScrollY / rowHeight));
-            var lastRow = Math.Min(rows - 1, (int)Math.Ceiling((this.symbolScrollY + gridHeight) / rowHeight));
+            var firstRow = Math.Max(0, (int)Math.Floor(scrollY / rowHeight));
+            var lastRow = Math.Min(rows - 1, (int)Math.Ceiling((scrollY + gridHeight) / rowHeight));
 
             IDisposable? pushedFont = null;
-            if (this.symbolFont.Available)
+            if (this.symbolFont is { Available: true })
             {
                 pushedFont = this.symbolFont.Push();
             }
@@ -710,51 +1199,52 @@ public sealed unsafe class Plugin : IDalamudPlugin
                 for (var col = 0; col < columns; col++)
                 {
                     var index = row * columns + col;
-                    if (index >= Symbols.Length)
+                    if (index >= entries.Count)
                     {
                         break;
                     }
 
-                    var symbol = Symbols[index];
-                    var cellMin = childOrigin + new Vector2(col * (cell + spacing), row * rowHeight - this.symbolScrollY);
-                    var cellMax = cellMin + new Vector2(cell, cell);
+                    var entry = entries[index];
+                    var cellMin = childOrigin + new Vector2(col * (cellWidth + spacing), row * rowHeight - scrollY);
+                    var cellMax = cellMin + new Vector2(cellWidth, cellHeight);
 
                     if (cellMax.Y < childOrigin.Y || cellMin.Y > childOrigin.Y + gridHeight)
                     {
                         continue;
                     }
 
-                    this.DrawSymbolCell(symbol, $"{idSuffix}-symbol-{index}", cellMin, cell, colors, this.IsFavorite(symbol), insertTarget);
+                    this.DrawSymbolCell(entry, $"{idSuffix}-entry-{this.selectedPopupTab}-{index}", cellMin, new Vector2(cellWidth, cellHeight), colors, allowfavs && this.IsFavorite(entry), insertTarget, allowfavs);
                 }
             }
 
             pushedFont?.Dispose();
 
+            // Custom scrollbar
             if (maxScroll > 0f)
             {
                 var barX = childOrigin.X + gridWidth + 6f * scale;
                 var barMin = new Vector2(barX, childOrigin.Y);
-                var barMax = new Vector2(barX + scrollBarWidth, childOrigin.Y + gridHeight);
+                var barMax = new Vector2(barX + scrollWidth, childOrigin.Y + gridHeight);
                 var thumbHeight = Math.Max(18f * scale, gridHeight * (gridHeight / (gridHeight + maxScroll)));
-                var thumbY = childOrigin.Y + (gridHeight - thumbHeight) * (this.symbolScrollY / maxScroll);
+                var thumbY = childOrigin.Y + (gridHeight - thumbHeight) * (scrollY / maxScroll);
                 var thumbMin = new Vector2(barX, thumbY);
-                var thumbMax = new Vector2(barX + scrollBarWidth, thumbY + thumbHeight);
+                var thumbMax = new Vector2(barX + scrollWidth, thumbY + thumbHeight);
 
                 var mouse = ImGui.GetIO().MousePos;
-                var thumbHovered = mouse.X >= thumbMin.X - 4f * scale && mouse.X <= thumbMax.X + 4f * scale && mouse.Y >= thumbMin.Y && mouse.Y <= thumbMax.Y;
-                var trackHovered = mouse.X >= barMin.X - 5f * scale && mouse.X <= barMax.X + 5f * scale && mouse.Y >= barMin.Y && mouse.Y <= barMax.Y;
+                var tHover = mouse.X >= thumbMin.X - 4f * scale && mouse.X <= thumbMax.X + 4f * scale && mouse.Y >= thumbMin.Y && mouse.Y <= thumbMax.Y;
+                var trackHover = mouse.X >= barMin.X - 5f * scale && mouse.X <= barMax.X + 5f * scale && mouse.Y >= barMin.Y && mouse.Y <= barMax.Y;
 
-                if (thumbHovered && ImGui.IsMouseClicked(ImGuiMouseButton.Left))
+                if (tHover && ImGui.IsMouseClicked(ImGuiMouseButton.Left))
                 {
                     this.draggingScrollBar = true;
                     this.scrollDragOffsetY = mouse.Y - thumbY;
                 }
-                else if (!thumbHovered && trackHovered && ImGui.IsMouseClicked(ImGuiMouseButton.Left))
+                else if (!tHover && trackHover && ImGui.IsMouseClicked(ImGuiMouseButton.Left))
                 {
                     this.draggingScrollBar = true;
                     this.scrollDragOffsetY = thumbHeight * 0.5f;
                     var targetThumbY = Math.Clamp(mouse.Y - this.scrollDragOffsetY, childOrigin.Y, childOrigin.Y + gridHeight - thumbHeight);
-                    this.symbolScrollY = Math.Clamp(((targetThumbY - childOrigin.Y) / Math.Max(1f, gridHeight - thumbHeight)) * maxScroll, 0f, maxScroll);
+                    scrollY = Math.Clamp(((targetThumbY - childOrigin.Y) / Math.Max(1f, gridHeight - thumbHeight)) * maxScroll, 0f, maxScroll);
                 }
 
                 if (this.draggingScrollBar)
@@ -762,7 +1252,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
                     if (ImGui.IsMouseDown(ImGuiMouseButton.Left))
                     {
                         var targetThumbY = Math.Clamp(mouse.Y - this.scrollDragOffsetY, childOrigin.Y, childOrigin.Y + gridHeight - thumbHeight);
-                        this.symbolScrollY = Math.Clamp(((targetThumbY - childOrigin.Y) / Math.Max(1f, gridHeight - thumbHeight)) * maxScroll, 0f, maxScroll);
+                        scrollY = Math.Clamp(((targetThumbY - childOrigin.Y) / Math.Max(1f, gridHeight - thumbHeight)) * maxScroll, 0f, maxScroll);
                     }
                     else
                     {
@@ -770,12 +1260,12 @@ public sealed unsafe class Plugin : IDalamudPlugin
                     }
                 }
 
-                thumbY = childOrigin.Y + (gridHeight - thumbHeight) * (this.symbolScrollY / maxScroll);
+                thumbY = childOrigin.Y + (gridHeight - thumbHeight) * (scrollY / maxScroll);
                 thumbMin = new Vector2(barX, thumbY);
-                thumbMax = new Vector2(barX + scrollBarWidth, thumbY + thumbHeight);
+                thumbMax = new Vector2(barX + scrollWidth, thumbY + thumbHeight);
 
-                drawList.AddRectFilled(barMin, barMax, Color(colors.ScrollTrack), scrollBarWidth * 0.5f);
-                drawList.AddRectFilled(thumbMin, thumbMax, Color((thumbHovered || this.draggingScrollBar) ? colors.ButtonHovered : colors.ScrollThumb), scrollBarWidth * 0.5f);
+                drawList.AddRectFilled(barMin, barMax, Color(colors.ScrollTrack), scrollWidth * 0.5f);
+                drawList.AddRectFilled(thumbMin, thumbMax, Color((tHover || this.draggingScrollBar) ? colors.ButtonHovered : colors.ScrollThumb), scrollWidth * 0.5f);
             }
             else
             {
@@ -786,27 +1276,38 @@ public sealed unsafe class Plugin : IDalamudPlugin
         ImGui.EndChild();
     }
 
-    private void DrawSymbolCell(string symbol, string id, Vector2 cellMin, float cell, UiColors colors, bool isFavorite, SymbolInsertTarget insertTarget)
+    private void DrawSymbolCell(string symbol, string id, Vector2 cellMin, Vector2 cellSize, UiColors colors, bool isFavorite, SymbolInsertTarget insertTarget, bool allowFavoriteToggle)
     {
         var scale = ImGuiHelpers.GlobalScale;
         var drawList = ImGui.GetWindowDrawList();
-        var cellMax = cellMin + new Vector2(cell, cell);
+        var cellMax = cellMin + cellSize;
 
         ImGui.SetCursorScreenPos(cellMin);
         ImGui.PushID(id);
-        var clicked = ImGui.InvisibleButton("##symbol", new Vector2(cell, cell));
+        var clicked = ImGui.InvisibleButton("##symbol", cellSize);
         var hovered = ImGui.IsItemHovered();
         ImGui.PopID();
 
         drawList.AddRectFilled(cellMin, cellMax, Color(hovered ? colors.CellHovered : colors.CellBackground), 5f * scale);
-        drawList.AddRect(cellMin, cellMax, Color(isFavorite ? colors.Border : colors.CellBorder), 5f * scale, ImDrawFlags.None, Math.Max(1f, scale));
 
         var textSize = ImGui.CalcTextSize(symbol);
-        drawList.AddText(cellMin + (new Vector2(cell, cell) - textSize) * 0.5f, Color(colors.SymbolText), symbol);
+        var textPos = cellMin + (cellSize - textSize) * 0.5f;
+        var clipMin = cellMin + new Vector2(3f * scale, 1f * scale);
+        var clipMax = cellMax - new Vector2(3f * scale, 1f * scale);
+        ImGui.PushClipRect(clipMin, clipMax, true);
+        drawList.AddText(textPos, Color(colors.SymbolText), symbol);
+        ImGui.PopClipRect();
 
         if (hovered)
         {
-            ImGui.SetTooltip(isFavorite ? "CTRL+Click to Unfavorite" : "CTRL+Click to Favorite");
+            if (allowFavoriteToggle)
+            {
+                ImGui.SetTooltip(isFavorite ? "CTRL+Click to Unfavorite" : "CTRL+Click to Favorite");
+            }
+            else
+            {
+                ImGui.SetTooltip(symbol);
+            }
         }
 
         if (!clicked)
@@ -814,7 +1315,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
             return;
         }
 
-        if (ImGui.GetIO().KeyCtrl)
+        if (allowFavoriteToggle && ImGui.GetIO().KeyCtrl)
         {
             this.ToggleFavorite(symbol);
         }
@@ -826,11 +1327,14 @@ public sealed unsafe class Plugin : IDalamudPlugin
 
     private void QueueInsertSymbol(string symbol, SymbolInsertTarget insertTarget)
     {
+        if (insertTarget == SymbolInsertTarget.FocusedTextInput)
+        {
+            this.InsertTextIntoFocusedTextInput(symbol);
+            return;
+        }
+
         if (insertTarget == SymbolInsertTarget.RecruitmentComment)
         {
-            // Insert immediately while the native Party Finder text input is still active.
-            // Delaying this until after the ImGui click finished could make the game field
-            // lose focus and leave its visual buffer temporarily duplicated.
             this.InsertTextIntoRecruitmentComment(symbol);
             return;
         }
@@ -842,6 +1346,64 @@ public sealed unsafe class Plugin : IDalamudPlugin
         }
 
         _ = Framework.RunOnTick(() => this.InsertTextIntoChat(symbol), delayTicks: 2);
+    }
+
+    private void AdvanceCaretOnNextTick(Action<int> advanceCaret, string insertedText)
+    {
+        var caretMoves = GetCaretMoveCount(insertedText);
+        if (caretMoves <= 0)
+        {
+            return;
+        }
+
+        _ = Framework.RunOnTick(() => advanceCaret(caretMoves), delayTicks: 1);
+    }
+
+    private void InsertTextIntoFocusedTextInput(string text)
+    {
+        try
+        {
+            var textInput = this.keybindTextInput;
+            if (textInput == null || !textInput->Enabled)
+            {
+                textInput = GetFocusedTextInput();
+            }
+
+            if (textInput == null || !textInput->Enabled)
+            {
+                return;
+            }
+
+            textInput->InsertText(text, false);
+            this.AdvanceCaretOnNextTick(this.AdvanceFocusedTextInputCaretRightIfStillActive, text);
+        }
+        catch (Exception ex)
+        {
+            Log.Error(ex, "Failed to insert Quick Symbols text into focused text input.");
+        }
+    }
+
+    private void AdvanceFocusedTextInputCaretRightIfStillActive(int caretMoves)
+    {
+        try
+        {
+            var textInput = this.keybindTextInput;
+            if (textInput == null || !textInput->Enabled)
+            {
+                textInput = GetFocusedTextInput();
+            }
+
+            if (textInput == null || !textInput->Enabled)
+            {
+                return;
+            }
+
+            SendRightArrowKeyPress(caretMoves);
+        }
+        catch (Exception ex)
+        {
+            Log.Debug($"Failed to advance Quick Symbols focused text input caret after insertion. {ex}");
+        }
     }
 
     private void InsertTextIntoChat(string text)
@@ -856,7 +1418,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
                 return;
             }
 
-            // Do not force ChatLog.Focus() here; it can desync the native chat input scroll/cursor state.
+            // Keep the native chat input in control; forcing focus here can desync its cursor state
             var textInput = chatLog->TextInput;
             if (!textInput->IsActive)
             {
@@ -865,8 +1427,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
 
             textInput->InsertText(text, false);
 
-            // Keep the accepted v19 behavior: let the game advance the native caret.
-            _ = Framework.RunOnTick(this.AdvanceChatCaretRightIfStillActive, delayTicks: 1);
+            this.AdvanceCaretOnNextTick(this.AdvanceChatCaretRightIfStillActive, text);
         }
         catch (Exception ex)
         {
@@ -883,8 +1444,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
                 return;
             }
 
-            // Match the safe ChatLog behavior: do not force focus or rewrite the whole
-            // text buffer. Only insert into the input if it is already active.
+            // Only insert while the native field is active. Rebuilding the whole buffer is risky here.
             if (!target.Input->IsActive)
             {
                 return;
@@ -892,7 +1452,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
 
             target.Input->InsertText(text, false);
 
-            _ = Framework.RunOnTick(this.AdvanceRecruitmentCommentCaretRightIfStillActive, delayTicks: 1);
+            this.AdvanceCaretOnNextTick(this.AdvanceRecruitmentCommentCaretRightIfStillActive, text);
         }
         catch (Exception ex)
         {
@@ -900,7 +1460,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
         }
     }
 
-    private void AdvanceChatCaretRightIfStillActive()
+    private void AdvanceChatCaretRightIfStillActive(int caretMoves)
     {
         try
         {
@@ -917,15 +1477,15 @@ public sealed unsafe class Plugin : IDalamudPlugin
                 return;
             }
 
-            SendRightArrowKeyPress();
+            SendRightArrowKeyPress(caretMoves);
         }
         catch (Exception ex)
         {
-            Log.Verbose(ex, "Failed to advance QuickSymbols chat input caret after insertion.");
+            Log.Debug($"Failed to advance QuickSymbols chat input caret after insertion. {ex}");
         }
     }
 
-    private void AdvanceRecruitmentCommentCaretRightIfStillActive()
+    private void AdvanceRecruitmentCommentCaretRightIfStillActive(int caretMoves)
     {
         try
         {
@@ -939,11 +1499,11 @@ public sealed unsafe class Plugin : IDalamudPlugin
                 return;
             }
 
-            SendRightArrowKeyPress();
+            SendRightArrowKeyPress(caretMoves);
         }
         catch (Exception ex)
         {
-            Log.Verbose(ex, "Failed to advance QuickSymbols recruitment comment caret after insertion.");
+            Log.Debug($"Failed to advance QuickSymbols recruitment comment caret after insertion. {ex}");
         }
     }
 
@@ -963,7 +1523,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
 
             target.Input->InsertText(text, false);
 
-            _ = Framework.RunOnTick(this.AdvanceMessageBookCaretRightIfStillActive, delayTicks: 1);
+            this.AdvanceCaretOnNextTick(this.AdvanceMessageBookCaretRightIfStillActive, text);
         }
         catch (Exception ex)
         {
@@ -971,7 +1531,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
         }
     }
 
-    private void AdvanceMessageBookCaretRightIfStillActive()
+    private void AdvanceMessageBookCaretRightIfStillActive(int caretMoves)
     {
         try
         {
@@ -985,14 +1545,15 @@ public sealed unsafe class Plugin : IDalamudPlugin
                 return;
             }
 
-            SendRightArrowKeyPress();
+            SendRightArrowKeyPress(caretMoves);
         }
         catch (Exception ex)
         {
-            Log.Verbose(ex, "Failed to advance QuickSymbols Message Book caret after insertion.");
+            Log.Debug($"Failed to advance QuickSymbols Message Book caret after insertion. {ex}");
         }
     }
 
+    // Addons (PF/Guestbook) searching logic
     private bool TryGetRecruitmentCommentTarget(out TextInputTarget target)
     {
         target = default;
@@ -1014,10 +1575,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
             var scale = Math.Clamp(addon->Scale, 0.65f, 2.4f);
             var candidates = new List<TextInputTarget>();
 
-            // Some game windows keep component nodes only in the ULD node list and not
-            // in a clean RootNode/ChildNode traversal. Scan both paths so the button can
-            // appear in Party Finder > Recruitment Criteria even when the Comment field
-            // is not reachable through RootNode recursion alone.
+            // Scan paths so the button can appear in Party Finder even when the Comment field is not reachable through RootNode recursion alone
             CollectTextInputTargetsFromNodeList(addon, scale, candidates);
             CollectTextInputTargetsFromTree(addon, addon->RootNode, scale, candidates, 0);
 
@@ -1081,9 +1639,6 @@ public sealed unsafe class Plugin : IDalamudPlugin
         var minimumWidth = 140f * ImGuiHelpers.GlobalScale;
         var minimumHeight = 24f * ImGuiHelpers.GlobalScale;
 
-        // The Recruitment Criteria comment box is the large multi-line text input in the
-        // left/middle area of the window. Password/item-level inputs are smaller and sit
-        // farther right, so prefer wide and taller inputs first.
         var best = candidates
             .Where(candidate => candidate.Size.X >= minimumWidth && candidate.Size.Y >= minimumHeight)
             .OrderByDescending(candidate => candidate.Size.X * candidate.Size.Y)
@@ -1110,8 +1665,6 @@ public sealed unsafe class Plugin : IDalamudPlugin
         var minimumWidth = 160f * ImGuiHelpers.GlobalScale;
         var minimumHeight = 22f * ImGuiHelpers.GlobalScale;
 
-        // The Message Book popup has one main wide text input. Prefer the widest
-        // visible text field, but keep a small height threshold so buttons/labels are ignored.
         var best = candidates
             .Where(candidate => candidate.Size.X >= minimumWidth && candidate.Size.Y >= minimumHeight)
             .OrderByDescending(candidate => candidate.Size.X)
@@ -1128,7 +1681,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
             .FirstOrDefault();
     }
 
-    private static void CollectTextInputTargetsFromNodeList(AtkUnitBase* addon, float unitScale, List<TextInputTarget> output)
+    private static void CollectTextInputTargetsFromNodeList(AtkUnitBase* addon, float scale, List<TextInputTarget> output)
     {
         if (addon == null || addon->UldManager.NodeList == null || addon->UldManager.NodeListCount <= 0)
         {
@@ -1138,11 +1691,11 @@ public sealed unsafe class Plugin : IDalamudPlugin
         var count = Math.Min((uint)addon->UldManager.NodeListCount, 4096u);
         for (var i = 0u; i < count; i++)
         {
-            AddTextInputTargetFromNode(addon, addon->UldManager.NodeList[i], unitScale, output);
+            AddTextInputTargetFromNode(addon, addon->UldManager.NodeList[i], scale, output);
         }
     }
 
-    private static void CollectTextInputTargetsFromTree(AtkUnitBase* addon, AtkResNode* startNode, float unitScale, List<TextInputTarget> output, int depth)
+    private static void CollectTextInputTargetsFromTree(AtkUnitBase* addon, AtkResNode* startNode, float scale, List<TextInputTarget> output, int depth)
     {
         if (addon == null || startNode == null || depth > 64)
         {
@@ -1153,18 +1706,18 @@ public sealed unsafe class Plugin : IDalamudPlugin
         var guard = 0;
         while (node != null && guard++ < 4096)
         {
-            AddTextInputTargetFromNode(addon, node, unitScale, output);
+            AddTextInputTargetFromNode(addon, node, scale, output);
 
             if (node->ChildNode != null)
             {
-                CollectTextInputTargetsFromTree(addon, node->ChildNode, unitScale, output, depth + 1);
+                CollectTextInputTargetsFromTree(addon, node->ChildNode, scale, output, depth + 1);
             }
 
             node = node->NextSiblingNode;
         }
     }
 
-    private static void AddTextInputTargetFromNode(AtkUnitBase* addon, AtkResNode* node, float unitScale, List<TextInputTarget> output)
+    private static void AddTextInputTargetFromNode(AtkUnitBase* addon, AtkResNode* node, float scale, List<TextInputTarget> output)
     {
         if (addon == null || node == null || !node->IsVisible())
         {
@@ -1177,7 +1730,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
             return;
         }
 
-        var size = GetNodeScreenSize(node, unitScale);
+        var size = GetNodeScreenSize(node, scale);
         if (size.X <= 10f || size.Y <= 10f)
         {
             return;
@@ -1185,8 +1738,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
 
         var position = new Vector2(node->ScreenX, node->ScreenY);
 
-        // Avoid exact duplicate entries because the same node can be found through both
-        // the ULD node list and the RootNode tree.
+        // Avoid exact duplicate entries
         foreach (var existing in output)
         {
             if (existing.Node == node)
@@ -1198,16 +1750,31 @@ public sealed unsafe class Plugin : IDalamudPlugin
         output.Add(new TextInputTarget(addon, input, node, position, size));
     }
 
-    private static void SendRightArrowKeyPress()
+    private static int GetCaretMoveCount(string text)
     {
-        if (!OperatingSystem.IsWindows())
+        if (string.IsNullOrEmpty(text))
+        {
+            return 0;
+        }
+
+        return Math.Clamp(StringInfo.ParseCombiningCharacters(text).Length, 1, 128);
+    }
+
+    // Win32 Interop to simulate arrows
+    private static void SendRightArrowKeyPress(int caretMoves)
+    {
+        if (!OperatingSystem.IsWindows() || caretMoves <= 0)
         {
             return;
         }
 
-        Span<Input> inputs = stackalloc Input[2];
-        inputs[0] = Input.Keyboard(VirtualKeyRight, 0);
-        inputs[1] = Input.Keyboard(VirtualKeyRight, KeyEventKeyUp);
+        var inputs = new Input[Math.Clamp(caretMoves, 1, 128) * 2];
+        for (var i = 0; i < inputs.Length; i += 2)
+        {
+            inputs[i] = Input.Keyboard(VirtualKeyRight, 0);
+            inputs[i + 1] = Input.Keyboard(VirtualKeyRight, KeyEventKeyUp);
+        }
+
         _ = SendInput((uint)inputs.Length, ref inputs[0], Marshal.SizeOf<Input>());
     }
 
@@ -1261,67 +1828,78 @@ public sealed unsafe class Plugin : IDalamudPlugin
     [DllImport("user32.dll", SetLastError = true)]
     private static extern uint SendInput(uint numberOfInputs, ref Input inputs, int sizeOfInputStructure);
 
-    private List<string> GetFavoriteSymbols()
+    // Configuration helpers
+    private List<string> Getfavsymbols()
     {
-        this.configuration.FavoriteSymbols ??= new List<string>();
-        if (this.configuration.FavoriteSymbols.Count <= 1)
+        this.Config.favsymbols ??= new List<string>();
+        this.Config.FavoriteSymbols ??= new List<string>();
+        if (this.Config.favsymbols.Count == 0 && this.Config.FavoriteSymbols.Count > 0)
         {
-            return this.configuration.FavoriteSymbols;
+            this.Config.favsymbols = this.Config.FavoriteSymbols.ToList();
+        }
+
+        if (this.Config.favsymbols.Count <= 1)
+        {
+            return this.Config.favsymbols;
         }
 
         var seen = new HashSet<string>(StringComparer.Ordinal);
         var changed = false;
-        for (var i = this.configuration.FavoriteSymbols.Count - 1; i >= 0; i--)
+        for (var i = this.Config.favsymbols.Count - 1; i >= 0; i--)
         {
-            var symbol = this.configuration.FavoriteSymbols[i];
+            var symbol = this.Config.favsymbols[i];
             if (string.IsNullOrWhiteSpace(symbol) || !seen.Add(symbol))
             {
-                this.configuration.FavoriteSymbols.RemoveAt(i);
+                this.Config.favsymbols.RemoveAt(i);
                 changed = true;
             }
         }
 
         if (changed)
         {
-            PluginInterface.SavePluginConfig(this.configuration);
+            this.Config.FavoriteSymbols = this.Config.favsymbols.ToList();
+            this.SaveConfig();
         }
 
-        return this.configuration.FavoriteSymbols;
+        return this.Config.favsymbols;
     }
 
     private bool IsFavorite(string symbol)
     {
-        return this.GetFavoriteSymbols().Contains(symbol, StringComparer.Ordinal);
+        return this.Getfavsymbols().Contains(symbol, StringComparer.Ordinal);
     }
 
     private void ToggleFavorite(string symbol)
     {
-        var favorites = this.GetFavoriteSymbols();
-        var existingIndex = favorites.FindIndex(item => string.Equals(item, symbol, StringComparison.Ordinal));
+        var favs = this.Getfavsymbols();
+        var existingIndex = favs.FindIndex(item => string.Equals(item, symbol, StringComparison.Ordinal));
         if (existingIndex >= 0)
         {
-            favorites.RemoveAt(existingIndex);
+            favs.RemoveAt(existingIndex);
         }
         else
         {
-            favorites.Add(symbol);
+            favs.Add(symbol);
         }
 
-        PluginInterface.SavePluginConfig(this.configuration);
+        this.Config.FavoriteSymbols = favs.ToList();
+        this.SaveConfig();
     }
 
     private void SaveConfigurationIfDirty()
     {
-        if (!this.buttonPositionDirty)
+        if (!this.bPositionDirty)
         {
             return;
         }
 
-        PluginInterface.SavePluginConfig(this.configuration);
-        this.buttonPositionDirty = false;
+        this.Config.HasCustomButtonPosition = this.Config.HasCustombPosition;
+        this.Config.ButtonPosition = this.Config.bPosition;
+        this.SaveConfig();
+        this.bPositionDirty = false;
     }
 
-    private static Vector2 GetNodeScreenSize(AtkResNode* node, float unitScale)
+    private static Vector2 GetNodeScreenSize(AtkResNode* node, float scale)
     {
         var scaleX = Math.Abs(node->ScaleX);
         var scaleY = Math.Abs(node->ScaleY);
@@ -1335,7 +1913,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
             scaleY = 1f;
         }
 
-        return new Vector2(node->Width * scaleX * unitScale, node->Height * scaleY * unitScale);
+        return new Vector2(node->Width * scaleX * scale, node->Height * scaleY * scale);
     }
 
     private static Vector2 ClampPositionToScreen(Vector2 position, Vector2 size)
@@ -1413,19 +1991,11 @@ public sealed unsafe class Plugin : IDalamudPlugin
         return symbols.ToArray();
     }
 
-    private enum PopupPlacement
-    {
-        AboveRight,
-        Below,
-    }
 
-    private enum SymbolInsertTarget
-    {
-        Chat,
-        RecruitmentComment,
-        MessageBookInput,
-    }
-
+    // Auxiliary Types
+    private enum PopupPlacement { AboveRight, Below }
+    private enum PopupTab { Symbols, Custom }
+    private enum SymbolInsertTarget { Chat, RecruitmentComment, MessageBookInput, FocusedTextInput }
     private readonly unsafe struct TextInputTarget
     {
         public TextInputTarget(AtkUnitBase* addon, AtkComponentTextInput* input, AtkResNode* node, Vector2 position, Vector2 size)
@@ -1442,22 +2012,6 @@ public sealed unsafe class Plugin : IDalamudPlugin
         public AtkResNode* Node { get; }
         public Vector2 Position { get; }
         public Vector2 Size { get; }
-    }
-
-    private static Vector4 WithAlpha(Vector4 color, float alpha)
-    {
-        return new Vector4(color.X, color.Y, color.Z, alpha);
-    }
-
-    private static Vector4 StrongButtonHover(UiColors colors)
-    {
-        var baseColor = colors.ButtonHovered;
-        var border = colors.Border;
-        return new Vector4(
-            Math.Clamp(baseColor.X * 0.68f + border.X * 0.32f, 0f, 1f),
-            Math.Clamp(baseColor.Y * 0.68f + border.Y * 0.32f, 0f, 1f),
-            Math.Clamp(baseColor.Z * 0.68f + border.Z * 0.32f, 0f, 1f),
-            Math.Clamp(Math.Max(baseColor.W, colors.Button.W) + 0.12f, 0f, 1f));
     }
 
     private enum GameUiTheme
@@ -1495,7 +2049,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
         }
         catch (Exception ex)
         {
-            Log.Verbose(ex, "Could not read ColorThemeType from game config.");
+            Log.Debug($"Could not read ColorThemeType from game config. {ex}");
         }
 
         return GameUiTheme.Unknown;
@@ -1652,7 +2206,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
             var scrollTrackAlpha = clearStyle ? 0.22f : 0.32f;
 
             return new UiColors(
-                PopupBackground: popup,
+                PopupBackground: WithAlpha(popup, Math.Clamp(popup.W + 0.15f, 0f, 1f)),
                 Button: button,
                 ButtonHovered: Lift(button, hoverLift, Math.Clamp(button.W + 0.08f, 0f, 1f)),
                 ButtonActive: Lift(button, activeLift, Math.Clamp(button.W + 0.12f, 0f, 1f)),
