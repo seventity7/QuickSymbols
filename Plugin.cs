@@ -129,8 +129,8 @@ public sealed unsafe class Plugin : IDalamudPlugin
     private float scrollDragOffsetY;
     private bool configWindowOpen;
     private bool hotkeyRecording;
-    private bool hotkeyFocused;
     private bool hotkeyWasDown;
+    private int hotkeyCaptureDelayFrames;
     private readonly List<VirtualKey> pendingHotkey = [];
     private readonly Stopwatch hotkeySafety = Stopwatch.StartNew();
     // #
@@ -159,7 +159,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
         this.Config.FavoriteSymbols ??= [];
         this.Config.favsymbols ??= [];
         this.Config.History ??= [];
-        this.Config.ToggleHotkey ??= [VirtualKey.MENU, VirtualKey.S];
+        this.Config.ToggleHotkey = NormalizeHotkey(this.Config.ToggleHotkey ?? [VirtualKey.MENU, VirtualKey.S]);
 
         if (this.Config.favsymbols.Count == 0 && this.Config.FavoriteSymbols.Count > 0)
         {
@@ -185,8 +185,8 @@ public sealed unsafe class Plugin : IDalamudPlugin
     public void Dispose()
     {
         Framework.Update -= this.FrameworkUpdate;
-        PluginInterface.UiBuilder.OpenConfigUi -= this.OpenConfigWindow;
         PluginInterface.UiBuilder.OpenMainUi -= this.OpenMainWindow;
+        PluginInterface.UiBuilder.OpenConfigUi -= this.OpenConfigWindow;
         PluginInterface.UiBuilder.Draw -= this.Draw;
 
         CommandManager.RemoveHandler(CommandShort);
@@ -232,7 +232,28 @@ public sealed unsafe class Plugin : IDalamudPlugin
 
     private void OpenMainWindow()
     {
-        this.configWindowOpen = true;
+        this.selectedPopupTab = PopupTab.Symbols;
+
+        var focused = GetFocusedTextInput();
+        if (focused != null)
+        {
+            var scale = ImGuiHelpers.GlobalScale;
+            this.keybindTextInput = focused;
+            this.keybindPopupAnchorSize = new Vector2(Math.Clamp(24f * scale, 18f * scale, 28f * scale));
+
+            var mousePos = ImGui.GetIO().MousePos;
+            var displaySize = ImGui.GetIO().DisplaySize;
+            if (mousePos.X < 0f || mousePos.Y < 0f || mousePos.X > displaySize.X || mousePos.Y > displaySize.Y)
+            {
+                mousePos = displaySize * 0.5f;
+            }
+
+            this.keybindPopupAnchorPos = ClampPositionToScreen(mousePos + new Vector2(12f * scale, 12f * scale), this.keybindPopupAnchorSize);
+            this.keybindPopupOpen = true;
+            return;
+        }
+
+        this.popupOpen = true;
     }
 
     private void DrawConfigWindow()
@@ -272,17 +293,9 @@ public sealed unsafe class Plugin : IDalamudPlugin
             return false;
         }
 
-        foreach (var vk in KeyState.GetValidVirtualKeys())
+        foreach (var key in keys)
         {
-            if (keys.Contains(vk))
-            {
-                if (!KeyState[vk])
-                {
-                    this.hotkeyWasDown = false;
-                    return false;
-                }
-            }
-            else if (KeyState[vk])
+            if (!KeyState[key])
             {
                 this.hotkeyWasDown = false;
                 return false;
@@ -297,7 +310,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
         this.hotkeyWasDown = true;
         foreach (var key in keys)
         {
-            KeyState[(int)key] = false;
+            KeyState[key] = false;
         }
 
         return true;
@@ -316,36 +329,38 @@ public sealed unsafe class Plugin : IDalamudPlugin
             hotkeyText = this.hotkeyRecording ? "Press keys..." : "None";
         }
 
-        ImGui.SetNextItemWidth(140f * ImGuiHelpers.GlobalScale);
+        ImGui.TextUnformatted(label);
+        ImGui.SameLine();
+
+        var displayText = $" {hotkeyText} ";
+        var displaySize = new Vector2(140f * ImGuiHelpers.GlobalScale, ImGui.GetFrameHeight());
         using (ImRaii.PushStyle(ImGuiStyleVar.FrameBorderSize, 2f))
         using (ImRaii.PushColor(ImGuiCol.Border, 0xFF00A5FF, this.hotkeyRecording))
         {
-            ImGui.InputText(label, ref hotkeyText, 100, ImGuiInputTextFlags.ReadOnly);
+            ImGui.Button($"{displayText}##QuickSymbolsHotkeyDisplay", displaySize);
         }
 
         if (this.hotkeyRecording)
         {
-            this.CaptureHotkeyInput();
-            if (!this.hotkeyFocused)
+            if (this.CaptureHotkeyInput())
             {
-                ImGui.SetKeyboardFocusHere(-1);
-                this.hotkeyFocused = true;
+                outKeys = NormalizeHotkey(this.pendingHotkey);
+                changed = outKeys.Length > 0;
+                if (changed)
+                {
+                    this.hotkeyRecording = false;
+                    this.hotkeyWasDown = true;
+                    this.hotkeySafety.Reset();
+                    this.pendingHotkey.Clear();
+                    this.hotkeyCaptureDelayFrames = 0;
+                    this.ClearPressedGameKeysDuringHotkeyRecording();
+                }
             }
 
             ImGui.SameLine();
-            if (ImGui.Button(this.pendingHotkey.Count > 0 ? "Confirm##QuickSymbolsHotkeyConfirm" : "Cancel##QuickSymbolsHotkeyCancel"))
+            if (ImGui.Button("Cancel##QuickSymbolsHotkeyCancel"))
             {
-                this.hotkeyRecording = false;
-                this.hotkeyFocused = false;
-                this.hotkeySafety.Reset();
-
-                if (this.pendingHotkey.Count > 0)
-                {
-                    outKeys = this.pendingHotkey.OrderBy(k => (int)k).ToArray();
-                    changed = true;
-                }
-
-                this.pendingHotkey.Clear();
+                this.CancelHotkeyRecording();
             }
         }
         else
@@ -353,51 +368,52 @@ public sealed unsafe class Plugin : IDalamudPlugin
             ImGui.SameLine();
             if (ImGui.Button("Set Keybind##QuickSymbolsSetHotkey"))
             {
-                this.hotkeyRecording = true;
-                this.hotkeyFocused = false;
-                this.pendingHotkey.Clear();
-                this.hotkeySafety.Restart();
+                this.BeginHotkeyRecording();
             }
         }
 
         return changed;
     }
 
-    private void CaptureHotkeyInput()
+    private bool CaptureHotkeyInput()
+    {
+        return this.ProcessHotkeyRecordingInput();
+    }
+
+    private bool ProcessHotkeyRecordingInput()
     {
         this.CheckHotkeyEditorSafety();
-        var io = ImGui.GetIO();
 
-        if (io.KeyAlt && !this.pendingHotkey.Contains(VirtualKey.MENU))
+        if (!this.hotkeyRecording)
         {
-            this.pendingHotkey.Add(VirtualKey.MENU);
+            return false;
         }
 
-        if (io.KeyShift && !this.pendingHotkey.Contains(VirtualKey.SHIFT))
+        if (this.hotkeyCaptureDelayFrames > 0)
         {
-            this.pendingHotkey.Add(VirtualKey.SHIFT);
+            this.ClearPressedGameKeysDuringHotkeyRecording();
+            this.hotkeyCaptureDelayFrames--;
+            return false;
         }
 
-        if (io.KeyCtrl && !this.pendingHotkey.Contains(VirtualKey.CONTROL))
+        foreach (var virtualKey in KeyState.GetValidVirtualKeys())
         {
-            this.pendingHotkey.Add(VirtualKey.CONTROL);
-        }
-
-        for (var key = 0; key < io.KeysDown.Length && key < 160; key++)
-        {
-            if (!io.KeysDown[key])
+            if (!KeyState[virtualKey])
             {
                 continue;
             }
 
-            var virtualKey = (VirtualKey)key;
+            KeyState[virtualKey] = false;
+
+            if (IsMouseButtonKey(virtualKey))
+            {
+                continue;
+            }
+
             if (virtualKey == VirtualKey.ESCAPE)
             {
-                this.hotkeyRecording = false;
-                this.hotkeyFocused = false;
-                this.pendingHotkey.Clear();
-                this.hotkeySafety.Reset();
-                return;
+                this.CancelHotkeyRecording();
+                return false;
             }
 
             if (!this.pendingHotkey.Contains(virtualKey))
@@ -405,17 +421,79 @@ public sealed unsafe class Plugin : IDalamudPlugin
                 this.pendingHotkey.Add(virtualKey);
             }
         }
+
+        return this.pendingHotkey.Any(key => !IsModifierKey(key));
+    }
+
+    private void ClearPressedGameKeysDuringHotkeyRecording()
+    {
+        foreach (var virtualKey in KeyState.GetValidVirtualKeys())
+        {
+            if (KeyState[virtualKey])
+            {
+                KeyState[virtualKey] = false;
+            }
+        }
+    }
+
+    private void FinishHotkeyRecording(VirtualKey[] keys)
+    {
+        this.Config.ToggleHotkey = keys;
+        this.hotkeyRecording = false;
+        this.hotkeyWasDown = true;
+        this.hotkeySafety.Reset();
+        this.pendingHotkey.Clear();
+        this.hotkeyCaptureDelayFrames = 0;
+        this.ClearPressedGameKeysDuringHotkeyRecording();
+        this.SaveConfig();
     }
 
     private void CheckHotkeyEditorSafety()
     {
         if (this.hotkeySafety.IsRunning && this.hotkeySafety.ElapsedMilliseconds > 5000)
         {
-            this.hotkeyRecording = false;
-            this.hotkeyFocused = false;
-            this.pendingHotkey.Clear();
-            this.hotkeySafety.Reset();
+            this.CancelHotkeyRecording();
         }
+    }
+
+    private void BeginHotkeyRecording()
+    {
+        this.hotkeyRecording = true;
+        this.hotkeyCaptureDelayFrames = 1;
+        this.pendingHotkey.Clear();
+        this.hotkeySafety.Restart();
+
+        foreach (var key in KeyState.GetValidVirtualKeys())
+        {
+            if (KeyState[key])
+            {
+                KeyState[key] = false;
+            }
+        }
+    }
+
+    private void CancelHotkeyRecording()
+    {
+        this.hotkeyRecording = false;
+        this.hotkeyCaptureDelayFrames = 0;
+        this.pendingHotkey.Clear();
+        this.hotkeySafety.Reset();
+    }
+
+    private static bool IsMouseButtonKey(VirtualKey key)
+    {
+        var value = (int)key;
+        return value is >= 0x01 and <= 0x06;
+    }
+
+    private static VirtualKey[] NormalizeHotkey(IEnumerable<VirtualKey> keys)
+    {
+        var validKeys = KeyState.GetValidVirtualKeys().ToHashSet();
+        return keys
+            .Where(key => validKeys.Contains(key) && !IsMouseButtonKey(key))
+            .Distinct()
+            .OrderBy(key => (int)key)
+            .ToArray();
     }
 
     private static string GetKeyName(VirtualKey key)
@@ -438,6 +516,72 @@ public sealed unsafe class Plugin : IDalamudPlugin
             _ => key.ToString(),
         };
     }
+
+    private void SuppressFocusedTextInputHotkeyCharacter(AtkComponentTextInput* textInput, VirtualKey[] keys)
+    {
+        if (textInput == null || !textInput->Enabled || !textInput->IsActive)
+        {
+            return;
+        }
+
+        if (!HasModifierKey(keys) || !TryGetSingleTextKey(keys, out var textKey))
+        {
+            return;
+        }
+
+        foreach (var key in keys)
+        {
+            KeyState[key] = false;
+        }
+
+        KeyState[textKey] = false;
+        _ = Framework.RunOnTick(() =>
+        {
+            var activeInput = this.keybindTextInput;
+            if (activeInput == null || !activeInput->Enabled || !activeInput->IsActive)
+            {
+                activeInput = GetFocusedTextInput();
+            }
+
+            if (activeInput == null || !activeInput->Enabled || !activeInput->IsActive)
+            {
+                return;
+            }
+
+            SendBackspaceKeyPress();
+        }, delayTicks: 1);
+    }
+
+    private static bool HasModifierKey(IEnumerable<VirtualKey> keys)
+    {
+        return keys.Any(IsModifierKey);
+    }
+
+    private static bool TryGetSingleTextKey(IEnumerable<VirtualKey> keys, out VirtualKey textKey)
+    {
+        textKey = default;
+        var textKeys = keys.Where(IsTextKey).Distinct().ToArray();
+        if (textKeys.Length != 1)
+        {
+            return false;
+        }
+
+        textKey = textKeys[0];
+        return true;
+    }
+
+    private static bool IsModifierKey(VirtualKey key)
+    {
+        var value = (int)key;
+        return value is 0x10 or 0x11 or 0x12 or >= 0xA0 and <= 0xA5;
+    }
+
+    private static bool IsTextKey(VirtualKey key)
+    {
+        var value = (int)key;
+        return value is >= 0x30 and <= 0x39 or >= 0x41 and <= 0x5A;
+    }
+
 
     private void DrawConfig(ref bool hasChanged)
     {
@@ -503,6 +647,20 @@ public sealed unsafe class Plugin : IDalamudPlugin
 
     private void FrameworkUpdate(IFramework framework)
     {
+        if (this.hotkeyRecording)
+        {
+            if (this.ProcessHotkeyRecordingInput())
+            {
+                var keys = NormalizeHotkey(this.pendingHotkey);
+                if (keys.Length > 0)
+                {
+                    this.FinishHotkeyRecording(keys);
+                }
+            }
+
+            return;
+        }
+
         if (!this.CheckHotkeyState(this.Config.ToggleHotkey))
         {
             return;
@@ -523,6 +681,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
 
         var scale = ImGuiHelpers.GlobalScale;
         this.keybindTextInput = focused;
+        this.SuppressFocusedTextInputHotkeyCharacter(focused, this.Config.ToggleHotkey);
         this.keybindPopupAnchorSize = new Vector2(Math.Clamp(24f * scale, 18f * scale, 28f * scale));
         this.keybindPopupAnchorPos = ClampPositionToScreen(ImGui.GetIO().MousePos + new Vector2(12f * scale, 12f * scale), this.keybindPopupAnchorSize);
         this.selectedPopupTab = PopupTab.Symbols;
@@ -568,7 +727,8 @@ public sealed unsafe class Plugin : IDalamudPlugin
             return null;
         }
 
-        return (AtkComponentTextInput*)focusParentComponent;
+        var inputComponent = (AtkComponentTextInput*)focusParentComponent;
+        return inputComponent->Enabled ? inputComponent : null;
     }
 
     private void Draw()
@@ -1763,21 +1923,32 @@ public sealed unsafe class Plugin : IDalamudPlugin
     // Win32 Interop to simulate arrows
     private static void SendRightArrowKeyPress(int caretMoves)
     {
-        if (!OperatingSystem.IsWindows() || caretMoves <= 0)
+        SendKeyPress(VirtualKeyRight, caretMoves);
+    }
+
+    private static void SendBackspaceKeyPress()
+    {
+        SendKeyPress(VirtualKeyBackspace, 1);
+    }
+
+    private static void SendKeyPress(ushort virtualKey, int pressCount)
+    {
+        if (!OperatingSystem.IsWindows() || pressCount <= 0)
         {
             return;
         }
 
-        var inputs = new Input[Math.Clamp(caretMoves, 1, 128) * 2];
+        var inputs = new Input[Math.Clamp(pressCount, 1, 128) * 2];
         for (var i = 0; i < inputs.Length; i += 2)
         {
-            inputs[i] = Input.Keyboard(VirtualKeyRight, 0);
-            inputs[i + 1] = Input.Keyboard(VirtualKeyRight, KeyEventKeyUp);
+            inputs[i] = Input.Keyboard(virtualKey, 0);
+            inputs[i + 1] = Input.Keyboard(virtualKey, KeyEventKeyUp);
         }
 
         _ = SendInput((uint)inputs.Length, ref inputs[0], Marshal.SizeOf<Input>());
     }
 
+    private const ushort VirtualKeyBackspace = 0x08;
     private const ushort VirtualKeyRight = 0x27;
     private const uint InputKeyboard = 1;
     private const uint KeyEventKeyUp = 0x0002;
